@@ -56,3 +56,6 @@ path.
 
 AGPL-3.0 (see `LICENSE`). Third-party notices in `THIRD_PARTY_NOTICES`; the
 engine's own notices are shipped as `THIRD_PARTY_NOTICES.logestix`.
+
+Release builds also bundle the libzmq Source Code Form (MPL-2.0) under
+`third_party/libzmq/`.

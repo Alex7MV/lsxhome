@@ -11,6 +11,10 @@ libzmq, simdjson, spdlog, abseil-cpp, and the Unicode Character
 Database). The components below are the ones introduced by this
 repository.
 
+Release builds additionally bundle the libzmq Source Code Form (Mozilla
+Public License 2.0) next to the binary under `third_party/libzmq/`,
+satisfying MPL-2.0 section 3.2(a) for the statically linked engine.
+
 ---
 
 ## Component index
