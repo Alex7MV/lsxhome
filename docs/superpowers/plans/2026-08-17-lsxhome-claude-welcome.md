@@ -27,13 +27,13 @@ Verified: `build/CMakeCache.txt` reports `CMAKE_GENERATOR=Visual Studio 18 2026`
 ### Task 1: Add a 34px Inter heading font via FontLoader
 
 **Files:**
-- Modify: `apps/lsxhome/include/lsxhome/font_loader.h`
-- Modify: `apps/lsxhome/src/font_loader.cpp`
-- Modify: `apps/lsxhome/src/main_win32.cpp`
+- Modify: `include/lsxhome/font_loader.h`
+- Modify: `src/font_loader.cpp`
+- Modify: `src/main_win32.cpp`
 
 - [ ] **Step 1: Declare `LoadHeading` in the header**
 
-Edit `apps/lsxhome/include/lsxhome/font_loader.h` — add a third method after `LoadMonospace`:
+Edit `include/lsxhome/font_loader.h` — add a third method after `LoadMonospace`:
 
 ```cpp
     /// Loads the embedded Inter at a larger point size for the welcome screen's
@@ -43,7 +43,7 @@ Edit `apps/lsxhome/include/lsxhome/font_loader.h` — add a third method after `
 
 - [ ] **Step 2: Implement `LoadHeading` in the source**
 
-Edit `apps/lsxhome/src/font_loader.cpp` — append inside `namespace lsxhome`:
+Edit `src/font_loader.cpp` — append inside `namespace lsxhome`:
 
 ```cpp
 ImFont* FontLoader::LoadHeading(ImFontAtlas& atlas) noexcept {
@@ -57,7 +57,7 @@ ImFont* FontLoader::LoadHeading(ImFontAtlas& atlas) noexcept {
 
 - [ ] **Step 3: Wire the heading font into the frame**
 
-Edit `apps/lsxhome/src/main_win32.cpp` — right after the `FontLoader::LoadDefault(*io.Fonts);` call at line 144:
+Edit `src/main_win32.cpp` — right after the `FontLoader::LoadDefault(*io.Fonts);` call at line 144:
 
 ```cpp
     // Hero heading face for the welcome screen's 34px greeting.
@@ -72,7 +72,7 @@ Expected: link succeeds (no font target changes — both face sizes reuse the sa
 - [ ] **Step 5: Commit**
 
 ```bash
-git add apps/lsxhome/include/lsxhome/font_loader.h apps/lsxhome/src/font_loader.cpp apps/lsxhome/src/main_win32.cpp
+git add include/lsxhome/font_loader.h src/font_loader.cpp src/main_win32.cpp
 git commit -m "feat: load 34px Inter heading font for lsxhome welcome screen"
 ```
 
@@ -81,13 +81,13 @@ git commit -m "feat: load 34px Inter heading font for lsxhome welcome screen"
 ### Task 2: Implement the Claude-style welcome interface
 
 **Files:**
-- Modify: `apps/lsxhome/include/lsxhome/gui_renderer.h`
-- Modify: `apps/lsxhome/src/gui_renderer.cpp`
-- Modify: `apps/lsxhome/src/main_win32.cpp`
+- Modify: `include/lsxhome/gui_renderer.h`
+- Modify: `src/gui_renderer.cpp`
+- Modify: `src/main_win32.cpp`
 
 - [ ] **Step 1: Declare the new API in the header**
 
-Replace the entire contents of `apps/lsxhome/include/lsxhome/gui_renderer.h` with:
+Replace the entire contents of `include/lsxhome/gui_renderer.h` with:
 
 ```cpp
 #pragma once
@@ -119,7 +119,7 @@ void BuildWorkspaceSkeleton(GuiBridge& bridge) noexcept;
 
 - [ ] **Step 2: Add helper widgets + implementation in the source**
 
-Edit `apps/lsxhome/src/gui_renderer.cpp`:
+Edit `src/gui_renderer.cpp`:
 
 First, extend the includes (keep the existing ones):
 
@@ -238,7 +238,7 @@ void DrawMCPTools(ImDrawList* dl, const ImVec2& pos, ImVec2 size, const char* la
 
 The `LoadHeading` call in Task 1 currently discards its return value, so the
 welcome interface would never receive the 34px face. In
-`apps/lsxhome/src/main_win32.cpp`, replace the caption/assignment set in Task 1
+`src/main_win32.cpp`, replace the caption/assignment set in Task 1
 so the returned face is handed to the renderer:
 
 ```cpp
@@ -251,7 +251,7 @@ needed — `main_win32.cpp` already includes `lsxhome/gui_renderer.h`.)
 
 - [ ] **Step 3: Implement `SetHeadingFont` + `DrawClaudeWelcomeInterface`**
 
-Edit `apps/lsxhome/src/gui_renderer.cpp` — insert these two functions right after the closing `}  // namespace` (which now ends around the block above) and before `ApplyBlackwellCoworkTheme()`:
+Edit `src/gui_renderer.cpp` — insert these two functions right after the closing `}  // namespace` (which now ends around the block above) and before `ApplyBlackwellCoworkTheme()`:
 
 ```cpp
 void SetHeadingFont(ImFont* font) noexcept {
@@ -360,7 +360,7 @@ void DrawClaudeWelcomeInterface() noexcept {
 
 - [ ] **Step 4: Repurpose the ##main panel**
 
-In `apps/lsxhome/src/gui_renderer.cpp`, inside `BuildWorkspaceSkeleton`, replace the body of the `##main` child block (currently the ImPlot Token Throughput panel at lines 117-130) with a call to the welcome interface:
+In `src/gui_renderer.cpp`, inside `BuildWorkspaceSkeleton`, replace the body of the `##main` child block (currently the ImPlot Token Throughput panel at lines 117-130) with a call to the welcome interface:
 
 ```cpp
     ImGui::SameLine();
@@ -388,7 +388,7 @@ Expected: `test_lsxhome_gui` and `test_lsxhome_font` PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add apps/lsxhome/include/lsxhome/gui_renderer.h apps/lsxhome/src/gui_renderer.cpp apps/lsxhome/src/main_win32.cpp
+git add include/lsxhome/gui_renderer.h src/gui_renderer.cpp src/main_win32.cpp
 git commit -m "feat: render Claude-style welcome interface in lsxhome ##main panel"
 ```
 

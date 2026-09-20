@@ -15,8 +15,8 @@ button cards.
 ## Scope & Placement
 
 - New self-contained function `void DrawClaudeWelcomeInterface()` implemented in
-  `apps/lsxhome/src/gui_renderer.cpp`, declared in
-  `apps/lsxhome/include/lsxhome/gui_renderer.h`.
+  `src/gui_renderer.cpp`, declared in
+  `include/lsxhome/gui_renderer.h`.
 - It becomes the **entire content** of the existing `##main` child inside
   `BuildWorkspaceSkeleton()`, **replacing** the ImPlot Token Throughput panel.
   The 300px sidebar is left unchanged.
@@ -28,7 +28,7 @@ button cards.
 - Only 15px Inter (default) + 14px JetBrains Mono are currently loaded. The
   greeting needs a large face.
 - Add `FontLoader::LoadHeading(ImFontAtlas&) -> ImFont*` in
-  `apps/lsxhome/src/font_loader.cpp` / `font_loader.h`, loading the embedded
+  `src/font_loader.cpp` / `font_loader.h`, loading the embedded
   Inter TTF at **34px** with the same imgui_freetype LCD flags
   (`LightHinting | ForceAutoHint`, `OversampleH=2`, `OversampleV=1`).
 - `main_win32.cpp` calls `LoadHeading(*io.Fonts)` once after `LoadDefault`.
