@@ -74,6 +74,10 @@ else()
     set(LSXHOME_LOGESTIX_DIR "${logestix_SOURCE_DIR}")
 endif()
 
+# libzmq is a logestix submodule (third_party/libzmq) and is linked statically
+# into the engine; its MPL-2.0 Source Code Form is bundled with Release builds.
+set(LSXHOME_LIBZMQ_SOURCE_DIR "${LSXHOME_LOGESTIX_DIR}/third_party/libzmq")
+
 # ── Dear ImGui docking branch (D3D12 + FreeType subpixel) ───────────────────
 set(LSXHOME_IMGUI_TAG v1.92.9-docking CACHE STRING "Dear ImGui docking-branch tag")
 FetchContent_Declare(
@@ -331,6 +335,18 @@ target_link_libraries(lsxhome PRIVATE
 )
 
 lsxhome_copy_third_party_notices(lsxhome)
+
+# MPL-2.0 section 3.2(a): ship the statically linked libzmq Source Code Form
+# next to the Release binary. The script is a no-op for Debug/other configs.
+add_custom_command(TARGET lsxhome POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        "-DLIBZMQ_SRC=${LSXHOME_LIBZMQ_SOURCE_DIR}"
+        "-DOUT_DIR=$<TARGET_FILE_DIR:lsxhome>/third_party/libzmq"
+        "-DCONFIG=$<CONFIG>"
+        "-DLOGESTIX_TAG=${LSXHOME_LOGESTIX_TAG}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_libzmq_source.cmake"
+    COMMENT "Bundling libzmq Source Code Form (MPL-2.0, Release only)"
+)
 
 # Full x64 machine optimization block: /MACHINE:X64 emits the PE32+ image,
 # /OPT:REF folds dead code, /OPT:ICF merges identical COMDATs (cross-TU,
