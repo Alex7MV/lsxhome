@@ -19,7 +19,7 @@ hosts. `linux-check` exists only to verify that no-op path.
 
 | Dependency | Version | Source | License | Type |
 |---|---|---|---|---|
-| logestix (`lsxcommon`) | pinned SHA `413b44e1…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
+| logestix (`lsxcommon`) | pinned SHA `8b2f986b…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
 | Dear ImGui | `v1.92.9-docking` | FetchContent | MIT | Static (`lsxhome_imgui`) |
 | ImPlot | `v1.0` | FetchContent | MIT | Static (`lsxhome_implot`) |
 | ImNodes | `v0.5` | FetchContent | MIT | Static (`lsxhome_imnodes`) |

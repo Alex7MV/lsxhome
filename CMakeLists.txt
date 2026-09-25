@@ -43,7 +43,7 @@ include(FetchContent)
 # ── Engine: pinned logestix checkout ─────────────────────────────────────────
 # The pin is a full commit SHA (logestix has no release tags). GIT_SHALLOW is
 # FALSE because a raw SHA cannot be fetched shallowly.
-set(LSXHOME_LOGESTIX_TAG "413b44e12eef959c81682ea702ae1298860fabf7" CACHE STRING "logestix commit SHA the engine is pinned to")
+set(LSXHOME_LOGESTIX_TAG "8b2f986b068d5c4b7254ea5b079587bc8797f761" CACHE STRING "logestix commit SHA the engine is pinned to")
 set(LSXHOME_LOGESTIX_SOURCE_DIR "" CACHE PATH "Local logestix checkout (development override)")
 
 # Build only the engine library from logestix — never its sibling applications,
@@ -62,7 +62,17 @@ else()
         GIT_TAG        "${LSXHOME_LOGESTIX_TAG}"
         GIT_SHALLOW    FALSE
     )
-    FetchContent_MakeAvailable(logestix)
+    # Populate first so the Windows/subproject compatibility patches can be
+    # applied before the engine's CMakeLists is executed — MakeAvailable would
+    # configure the engine immediately. Same after-fetch pattern as ImNodes
+    # and FreeType below.
+    FetchContent_GetProperties(logestix)
+    if(NOT logestix_POPULATED)
+        FetchContent_Populate(logestix)
+    endif()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_logestix_subproject.cmake)
+    lsxhome_patch_logestix_subproject("${logestix_SOURCE_DIR}")
+    add_subdirectory("${logestix_SOURCE_DIR}" "${FETCHCONTENT_BASE_DIR}/logestix-build")
 endif()
 
 # Resolve the engine source directory so its own THIRD_PARTY_NOTICES can be
