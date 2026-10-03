@@ -603,24 +603,59 @@ TEST_CASE("lsxhome: an unrecognised model path is passed through untouched",
 }
 
 // ── Engine-text normalization ──────────────────────────────────────────────
-TEST_CASE("lsxhome: the byte-level space marker decodes back to a space",
+namespace {
+/// Byte-level BPE escapes a vocabulary entry as a Latin-1 supplement glyph:
+/// the byte 0x20 becomes U+0120, 0x09 U+0109, 0x0A U+010A. Built as raw bytes
+/// because `\xNN` escapes are greedy and would swallow the next character.
+std::string ByteLevelMarker(unsigned cp) {
+    std::string out;
+    if (cp < 0x80u) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800u) {
+        out += static_cast<char>(0xC0u | (cp >> 6));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    } else {
+        out += static_cast<char>(0xE0u | (cp >> 12));
+        out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+        out += static_cast<char>(0x80u | (cp & 0x3Fu));
+    }
+    return out;
+}
+}  // namespace
+
+TEST_CASE("lsxhome: byte-level BPE markers decode back to their bytes",
           "[lsxhome][chat]") {
-    // A byte-level BPE vocabulary stores the space as U+0120 (LATIN CAPITAL G
-    // WITH MACRON, bytes C4 A0). The engine's decoder returns the raw bytes, so
-    // the model's answers arrive with no ordinary space at all: the whole
-    // answer becomes one 500+ byte "word", which the vocabulary refuses to
-    // encode (kMaxWordBytes) — and the next prompt is rejected wholesale.
-    // The byte-level BPE spelling of a space: U+0120, bytes C4 A0.
-    const std::string marker = {static_cast<char>(0xC4),
-                                static_cast<char>(0xA0)};
-    const std::string answer =
-        std::string(kHello) + marker + std::string(kWorld) + marker + "ok";
+    // The engine's decoder returns raw vocabulary bytes, so a generated answer
+    // arrives with no ordinary space and no ordinary newline — just U+0120 and
+    // U+010A. Framing that answer back into the next prompt then fails twice
+    // over: the vocabulary sees one 500+ byte "word" (kMaxWordBytes is 512), and
+    // the model reads the glyphs as mojibake ("wrong encoding").
+    REQUIRE(lsxhome::NormalizeEngineText(
+                ByteLevelMarker(0x0120)) == " ");  // U+0120 -> space
+    REQUIRE(lsxhome::NormalizeEngineText(
+                ByteLevelMarker(0x010A)) == "\n");  // U+010A -> newline
+    REQUIRE(lsxhome::NormalizeEngineText(
+                ByteLevelMarker(0x0109)) == "\t");  // U+0109 -> tab
+    // The whole range must round-trip, not just the three that are common.
+    for (unsigned cp = 0x0100u; cp <= 0x0143u; ++cp) {
+        const std::string marker = ByteLevelMarker(cp);
+        const std::string decoded = lsxhome::NormalizeEngineText(marker);
+        INFO("codepoint=0x" << std::hex << cp << " marker_size=" << marker.size()
+                            << " decoded_size=" << decoded.size());
+        REQUIRE_FALSE(decoded.empty());
+        REQUIRE(decoded.size() == 1u);
+    }
 
-    const std::string normalized = lsxhome::NormalizeEngineText(answer);
-    REQUIRE(normalized == std::string(kHello) + " " + kWorld + " ok");
+    // A full sentence of markers turns back into readable text with real word
+    // boundaries.
+    const std::string sentence =
+        ByteLevelMarker(0x0120) + std::string(kHello) + ByteLevelMarker(0x0120) +
+        std::string(kWorld) + ByteLevelMarker(0x010A) + ByteLevelMarker(0x010A) +
+        std::string(kWorld);
+    const std::string normalized = lsxhome::NormalizeEngineText(sentence);
+    REQUIRE(normalized ==
+            std::string(" ") + kHello + " " + kWorld + "\n\n" + kWorld);
 
-    // The point of the fix: spaces are separated again, so no single "word"
-    // approaches the engine's 512-byte limit.
     std::size_t longest = 0;
     std::size_t run = 0;
     for (const char ch : normalized) {
