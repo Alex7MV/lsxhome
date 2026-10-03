@@ -6,6 +6,8 @@
 // file stays free of engine types, so the session logic is unit-testable.
 
 #include "lsxhome/lsx_generation_backend.h"
+#include "lsxhome/model_root.h"
+#include "lsxhome/text_normalizer.h"
 
 #include <cstdint>
 #include <memory>
@@ -15,14 +17,16 @@
 
 #include "lsxcommon/chat_conversation.h"
 #include "lsxcommon/incremental_detokenizer.h"
+#include "lsxcommon/log.h"
 #include "lsxcommon/model.h"
 #include "lsxcommon/model_engine.h"
 #include "lsxcommon/model_factory.h"
 
+#include <absl/strings/str_cat.h>
+
 namespace lsxhome {
 namespace {
 
-/// Tokens generated per answer. A chat surface budget, not a benchmark knob.
 constexpr int kMaxGenTokens = 512;
 
 class LsxGenerationBackend final : public GenerationBackend {
@@ -43,16 +47,19 @@ public:
         session_ = std::make_unique<lsxcommon::InferenceEngine::Session>();
 
         lsxcommon::ModelInitConfig config;
-        config.model_path = model_path_;
+        // The factory autodetects the family from <root>/logestix/
+        // model.index.json, so a converted-directory spelling is normalized
+        // here instead of failing autodetection.
+        config.model_path = ResolveModelRoot(model_path_);
         config.max_gen_tokens = kMaxGenTokens;
         model_ = lsxcommon::LsxModelFactory::Create(config);
         if (!model_) {
-            out_error = "failed to open the model: " + model_path_;
+            out_error = "failed to open the model: " + config.model_path;
             session_.reset();
             return false;
         }
         if (!model_->Load()) {
-            out_error = "failed to load the model: " + model_path_;
+            out_error = "failed to load the model: " + config.model_path;
             model_.reset();
             session_.reset();
             return false;
@@ -71,23 +78,35 @@ public:
 
         // Chat-template framing: the model's own BuildConversationInputIds
         // renders the roles (and the system prompt, when a family has one); the
-        // generic Hermes fallback flattens the transcript.
+        // generic Hermes fallback flattens the transcript. Messages are
+        // normalized first: a pasted question can carry the same exotic spaces
+        // the model's own answers do, and those break the vocabulary encode.
         lsxcommon::ChatConversation conversation;
         conversation.messages.reserve(history.size());
         for (const ChatTurn& turn : history) {
             lsxcommon::ChatMessage message;
             message.role = turn.role;
-            message.content = turn.text;
+            message.content = NormalizeEngineText(turn.text);
             conversation.messages.push_back(std::move(message));
         }
 
+        // One framing attempt: the conversation is rendered with the model's own
+        // chat template and encoded with its vocabulary. A rejection here is
+        // reported to the user instead of being swallowed.
         std::vector<std::int32_t> input_ids;
         if (!model_->BuildConversationInputIds(model_->Tokenizer(),
                                                conversation, input_ids) ||
             input_ids.empty()) {
-            out_error = "failed to frame the prompt for the model";
+            out_error =
+                "the model's vocabulary rejected the prompt (a character in the "
+                "conversation has no token)";
+            lsxcommon::log::error(absl::StrCat("[engine] ", out_error));
             return GenerationStatus::kError;
         }
+
+        lsxcommon::log::info(absl::StrCat(
+            "[engine] generate: history=", history.size(),
+            " input_ids=", input_ids.size()));
 
         // Per-token detokenization with UTF-8 boundary safety: every delta is
         // valid text, never half a codepoint. ArrowDecoder supplies the real
@@ -98,13 +117,16 @@ public:
 
         lsxcommon::ModelRequest request{std::move(input_ids), kMaxGenTokens};
         request.abort_flag = &abort;
+        // Normalize before the sink, so the transcript, the framed history and
+        // what the user sees all carry the same plain spaces: this model emits
+        // U+00A0, which its own vocabulary cannot encode back.
         request.token_callback =
             [&detokenizer, &sink](const lsxcommon::TokenChunk& chunk) {
                 if (chunk.is_special) {
                     return;
                 }
-                const std::string delta = detokenizer.Push(
-                    static_cast<std::int32_t>(chunk.token_id));
+                const std::string delta = NormalizeEngineText(
+                    detokenizer.Push(static_cast<std::int32_t>(chunk.token_id)));
                 if (!delta.empty()) {
                     sink(delta);
                 }
@@ -113,7 +135,8 @@ public:
         const lsxcommon::gpu::InferenceResult result = model_->Infer(request);
 
         // Release any bytes the detokenizer withheld at a stream boundary.
-        const std::string tail = detokenizer.Flush();
+        const std::string tail =
+            NormalizeEngineText(detokenizer.Flush());
         if (!tail.empty()) {
             sink(tail);
         }

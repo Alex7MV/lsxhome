@@ -17,6 +17,7 @@
 #include "lsxhome/gui_renderer.h"
 #include "lsxhome/lsx_generation_backend.h"
 
+#include "lsxcommon/core.h"
 #include "lsxcommon/generation_cli.h"
 
 #include <absl/flags/flag.h>
@@ -25,6 +26,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +41,9 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 // default blueprint prompt via lsxcommon::cli.
 ABSL_FLAG(std::string, run, "", "generation prompt (--run \"PROMPT\" / -r \"PROMPT\")");
 ABSL_FLAG(std::string, model, "", "model path for the --run generation path");
+// The shell is a WIN32-subsystem app with no console of its own, so diagnostics
+// would vanish; --log redirects stdout into a file for a run captured headless.
+ABSL_FLAG(std::string, log, "", "write diagnostics to this file instead of the console");
 
 namespace {
 
@@ -76,6 +81,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     argv_ptrs.reserve(normalized.size());
     for (auto& arg : normalized) argv_ptrs.push_back(arg.data());
     absl::ParseCommandLine(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+
+const std::string& log_path = absl::GetFlag(FLAGS_log);
+    if (!log_path.empty()) {
+        // The shell is a WIN32-subsystem app with no console, and the engine's
+        // log facade is a no-op until Core::Initialize installs spdlog's
+        // console + rotating-file sinks. A path therefore starts the engine's
+        // own file logger, which is also what every engine app does.
+        lsxcommon::Core::Initialize(log_path);
+    }
 
     std::string run_prompt =
         lsxcommon::cli::ResolveGenerationPrompt(absl::GetFlag(FLAGS_run));

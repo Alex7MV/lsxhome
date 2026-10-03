@@ -11,6 +11,9 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include "lsxcommon/log.h"
+
+#include <absl/strings/str_cat.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -57,6 +60,22 @@ constexpr ImU32 kLoadingU32   = IM_COL32(148, 148, 158, 255);
 // ImGui widgets take an ImVec4; the packed accents above are for draw lists.
 ImVec4 WidgetColor(ImU32 packed) noexcept {
     return ImGui::ColorConvertU32ToFloat4(packed);
+}
+
+// Debug aid: printable ASCII passes through, everything else becomes \xNN so a
+// broken or invisible codepoint in generated text is visible in the log.
+std::string DebugEscape(std::string_view text, std::size_t max_bytes) {
+    std::string out;
+    for (std::size_t i = 0; i < text.size() && i < max_bytes; ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c >= 0x20 && c < 0x7F) {
+            out += static_cast<char>(c);
+        } else {
+            out += absl::StrCat("\\x", absl::Hex(static_cast<int>(c),
+                                                 absl::kZeroPad2));
+        }
+    }
+    return out;
 }
 
 ImFont* g_heading_font = nullptr;
@@ -194,15 +213,28 @@ void DrawStatusLines(const lsxhome::ChatSession& session,
 
 void SubmitDraft(lsxhome::ChatSession& session, lsxhome::ChatState& state,
                  bool requested) noexcept {
-    if (!requested || session.Busy() || g_question[0] == '\0') {
+    if (!requested) {
+        return;
+    }
+    lsxcommon::log::info(absl::StrCat(
+        "[ui] submit requested: busy=", session.Busy() ? 1 : 0,
+        " phase=", PhaseLabel(session.phase()),
+        " draft_len=", std::strlen(g_question),
+        " messages=", state.messages().size()));
+    if (session.Busy() || g_question[0] == '\0') {
+        lsxcommon::log::info("[ui] submit ignored (busy or empty draft)");
         return;
     }
     // Queue first: a refused Submit (full queue / oversized question) must leave
     // the transcript untouched and keep the draft for the next attempt.
     if (!session.Submit(g_question)) {
+        lsxcommon::log::info("[ui] session refused the question");
         return;
     }
-    state.BeginTurn(g_question);
+    const bool opened = state.BeginTurn(g_question);
+    lsxcommon::log::info(absl::StrCat(
+        "[ui] question queued; turn_opened=", opened ? 1 : 0,
+        " busy_now=", session.Busy() ? 1 : 0));
     g_question[0] = '\0';
 }
 
@@ -459,9 +491,21 @@ void DrawChatPanel(ChatSession& session, ChatState& state) noexcept {
     // with its tail unread.
     session.DrainInto(state);
     if (state.Busy() && !session.Busy()) {
-        state.EndTurn(session.phase() == ChatPhase::kError
-                          ? true
-                          : session.TakeInterrupted());
+        const bool interrupted =
+            session.phase() == ChatPhase::kError ? true
+                                                 : session.TakeInterrupted();
+        lsxcommon::log::info(absl::StrCat(
+            "[ui] turn closed: interrupted=", interrupted ? 1 : 0,
+            " phase=", PhaseLabel(session.phase()),
+            " answer_chars=",
+            state.messages().empty() ? 0u : state.messages().back().text.size(),
+            "\n[ui] answer_tail=", DebugEscape(state.messages().empty()
+                                                   ? std::string_view()
+                                                   : std::string_view(
+                                                         state.messages().back()
+                                                             .text),
+                                               240)));
+        state.EndTurn(interrupted);
     }
 
     if (state.empty()) {

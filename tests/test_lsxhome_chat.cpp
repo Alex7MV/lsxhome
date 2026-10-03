@@ -4,12 +4,16 @@
 #include "lsxhome/chat_state.h"
 #include "lsxhome/generation_backend.h"
 #include "lsxhome/gui_bridge.h"
+#include "lsxhome/model_root.h"
+#include "lsxhome/text_normalizer.h"
 #include "lsxhome/text_splitter.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <new>
 #include <string>
@@ -43,13 +47,22 @@ void operator delete[](void*, std::size_t) noexcept {}
 
 namespace {
 
-// This file is deliberately ASCII-only: a narrow literal with non-ASCII bytes
-// is interpreted through the compiler's source codepage, which is not
-// guaranteed to be UTF-8. Multibyte text is spelled as explicit UTF-8 bytes
-// so the assertions test the chunker, not the toolchain's decoding.
-const char* const kHello = "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82";  // Привет
-const char* const kWorld = "\xD0\xBC\xD0\xB8\xD1\x80";                          // мир
-const char* const kGlobe = "\xF0\x9F\x8C\x8D";                                  // 🌍
+// ASCII-only source: a narrow literal with non-ASCII bytes is interpreted
+// through the compiler's source codepage, which is not guaranteed to be UTF-8,
+// and `\xNN` escapes are greedy — so every multibyte string is built from
+// explicit bytes instead. Then the assertions test the chunker, not the
+// toolchain's decoding.
+const std::string kHello = {static_cast<char>(0xD0), static_cast<char>(0x9F),
+                            static_cast<char>(0xD1), static_cast<char>(0x80),
+                            static_cast<char>(0xD0), static_cast<char>(0xB8),
+                            static_cast<char>(0xD0), static_cast<char>(0xB2),
+                            static_cast<char>(0xD0), static_cast<char>(0xB5),
+                            static_cast<char>(0xD1), static_cast<char>(0x82)};  // Привет
+const std::string kWorld = {static_cast<char>(0xD0), static_cast<char>(0xBC),
+                            static_cast<char>(0xD0), static_cast<char>(0xB8),
+                            static_cast<char>(0xD1), static_cast<char>(0x80)};  // мир
+const std::string kGlobe = {static_cast<char>(0xF0), static_cast<char>(0x9F),
+                            static_cast<char>(0x8C), static_cast<char>(0x8D)};  // 🌍
 
 // Strict UTF-8 validator: rejects truncated sequences, stray continuation
 // bytes and lead bytes with no continuation. A chunk carrying half a codepoint
@@ -536,4 +549,135 @@ TEST_CASE("lsxhome: draining streamed chunks never allocates", "[lsxhome][chat]"
 
     REQUIRE(after - before == 0);
     REQUIRE(state.messages()[1].text.size() == kChunks);
+}
+// ── Model path resolution ──────────────────────────────────────────────────
+namespace {
+
+namespace fs = std::filesystem;
+
+/// A throwaway directory tree; removed on scope exit.
+struct TempTree {
+    fs::path root;
+
+    explicit TempTree(const char* name) {
+        root = fs::temp_directory_path() / name;
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        fs::create_directories(root, ec);
+    }
+    ~TempTree() {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
+
+    fs::path WriteIndex(const fs::path& dir) {
+        fs::create_directories(dir);
+        std::ofstream out(dir / "model.index.json");
+        out << R"({"model": "gemma-4-26b-a4b-it"})";
+        return dir;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("lsxhome: a converted model directory resolves to its model root",
+          "[lsxhome][chat]") {
+    // The engine appends `logestix/model.index.json` itself, so it wants the
+    // model ROOT. Passing the converted directory instead used to fail
+    // autodetection with "cannot autodetect model type from ...".
+    TempTree tree("lsxhome_model_root_root");
+    const fs::path converted = tree.WriteIndex(tree.root / "logestix");
+
+    REQUIRE(lsxhome::ResolveModelRoot(converted.string()) == tree.root.string());
+    // The root itself passes through unchanged.
+    REQUIRE(lsxhome::ResolveModelRoot(tree.root.string()) == tree.root.string());
+}
+
+TEST_CASE("lsxhome: an unrecognised model path is passed through untouched",
+          "[lsxhome][chat]") {
+    TempTree tree("lsxhome_model_root_unknown");
+    // No index anywhere: let the engine report its own error rather than
+    // silently rewriting the user's path.
+    REQUIRE(lsxhome::ResolveModelRoot(tree.root.string()) == tree.root.string());
+    REQUIRE(lsxhome::ResolveModelRoot("").empty());
+}
+
+// ── Engine-text normalization ──────────────────────────────────────────────
+TEST_CASE("lsxhome: the byte-level space marker decodes back to a space",
+          "[lsxhome][chat]") {
+    // A byte-level BPE vocabulary stores the space as U+0120 (LATIN CAPITAL G
+    // WITH MACRON, bytes C4 A0). The engine's decoder returns the raw bytes, so
+    // the model's answers arrive with no ordinary space at all: the whole
+    // answer becomes one 500+ byte "word", which the vocabulary refuses to
+    // encode (kMaxWordBytes) — and the next prompt is rejected wholesale.
+    // The byte-level BPE spelling of a space: U+0120, bytes C4 A0.
+    const std::string marker = {static_cast<char>(0xC4),
+                                static_cast<char>(0xA0)};
+    const std::string answer =
+        std::string(kHello) + marker + std::string(kWorld) + marker + "ok";
+
+    const std::string normalized = lsxhome::NormalizeEngineText(answer);
+    REQUIRE(normalized == std::string(kHello) + " " + kWorld + " ok");
+
+    // The point of the fix: spaces are separated again, so no single "word"
+    // approaches the engine's 512-byte limit.
+    std::size_t longest = 0;
+    std::size_t run = 0;
+    for (const char ch : normalized) {
+        run = (ch == ' ') ? 0 : run + 1;
+        longest = std::max(longest, run);
+    }
+    REQUIRE(longest < 64);
+}
+
+TEST_CASE("lsxhome: non-breaking spaces become plain spaces", "[lsxhome][chat]") {
+    // The engine's vocabulary has no U+00A0, so a model that emits it makes
+    // arrow_tokenizer_encode fail and the whole next prompt is rejected.
+    const std::string nbsp = {static_cast<char>(0xC2),
+                              static_cast<char>(0xA0)};  // U+00A0
+    const std::string narrow = {static_cast<char>(0xE2),
+                                static_cast<char>(0x80),
+                                static_cast<char>(0xAF)};  // U+202F
+    const std::string figure = {static_cast<char>(0xE2),
+                                static_cast<char>(0x80),
+                                static_cast<char>(0x87)};  // U+2007
+    const std::string thin = {static_cast<char>(0xE2),
+                              static_cast<char>(0x80),
+                              static_cast<char>(0x89)};  // U+2009
+    const std::string em = {static_cast<char>(0xE3),
+                            static_cast<char>(0x80),
+                            static_cast<char>(0x80)};  // U+3000
+
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + nbsp + kWorld) ==
+            std::string(kHello) + " " + kWorld);
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + narrow + kWorld) ==
+            std::string(kHello) + " " + kWorld);
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + figure + kWorld) ==
+            std::string(kHello) + " " + kWorld);
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + thin + kWorld) ==
+            std::string(kHello) + " " + kWorld);
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + em + kWorld) ==
+            std::string(kHello) + " " + kWorld);
+
+    // Only the characters are rewritten, never collapsed: two exotic spaces
+    // stay two spaces, so the model's own spacing survives untouched.
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + nbsp + narrow + kWorld) ==
+            std::string(kHello) + "  " + kWorld);
+}
+
+TEST_CASE("lsxhome: normalization leaves ordinary text byte-identical",
+          "[lsxhome][chat]") {
+    const std::string plain = "Plain ASCII text";
+    REQUIRE(lsxhome::NormalizeEngineText(plain) == plain);
+
+    const std::string cyrillic = "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82";  // Привет
+    REQUIRE(lsxhome::NormalizeEngineText(cyrillic) == cyrillic);
+
+    // Tabs, newlines and punctuation are content, not spacing quirks.
+    const std::string layout = "line1\nline2\ttabbed \"quoted\" **bold**";
+    REQUIRE(lsxhome::NormalizeEngineText(layout) == layout);
+
+    REQUIRE(lsxhome::NormalizeEngineText("").empty());
+    // A 4-byte emoji survives: only spaces are touched.
+    REQUIRE(lsxhome::NormalizeEngineText(kGlobe) == kGlobe);
 }
