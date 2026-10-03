@@ -309,6 +309,7 @@ add_executable(lsxhome WIN32
     src/d3d12_renderer.cpp
     src/font_loader.cpp
     src/gui_renderer.cpp
+    src/lsx_generation_backend.cpp
 )
 target_include_directories(lsxhome PRIVATE include)
 target_compile_definitions(lsxhome PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
