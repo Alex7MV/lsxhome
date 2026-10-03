@@ -13,8 +13,10 @@
 #include "lsxhome/font_loader.h"
 #include "lsxhome/gui_bridge.h"
 #include "lsxhome/gui_renderer.h"
+#include "lsxhome/text_splitter.h"
 
 #include "lsxcommon/generation_cli.h"
+#include "lsxcommon/log.h"
 #include "lsxcommon/model.h"
 #include "lsxcommon/model_engine.h"
 #include "lsxcommon/model_factory.h"
@@ -22,6 +24,7 @@
 
 #include <absl/flags/flag.h>
 #include <absl/flags/parse.h>
+#include <absl/strings/str_cat.h>
 
 #include <windows.h>
 
@@ -53,8 +56,9 @@ constexpr const wchar_t* kWindowTitle = L"lsxhome — LogestiX Home";
 constexpr int kDefaultWidth = 1440;
 constexpr int kDefaultHeight = 900;
 
-// GLM-5.2 self-check token: 11751 decodes to "Paris".
-constexpr std::uint32_t kParisTokenId = 11751;
+// Words consumed from one chunk of generated text per splitter call. Bounded so
+// the stack view array in the producer loop stays fixed-size.
+constexpr std::size_t kMaxWordsPerChunk = 64;
 
 lsxhome::D3D12Renderer* g_renderer = nullptr;
 
@@ -80,8 +84,9 @@ void ComputeProducer(lsxhome::GuiBridge& bridge, std::atomic<bool>& running,
                      const std::string& prompt) {
     bool published = false;
     // Runs the resolved generation prompt through the model once and publishes
-    // each decoded token into the SPSC bridge. Falls back to the previous demo
-    // behavior (single "Paris" token pump) when no model is loadable.
+    // each decoded word into the SPSC bridge. When no model was requested there
+    // is nothing to run, so MakeFallbackTokenPayload emits the deterministic
+    // GLM-5.2 self-check token (11751 -> "Paris") instead.
     if (!model_path.empty()) {
         // Fixed-speed policy: the engine session applies the per-GPU knob
         // policy (same as lsxfabric/lsxbenchmark) on entry and tears the
@@ -97,17 +102,33 @@ void ComputeProducer(lsxhome::GuiBridge& bridge, std::atomic<bool>& running,
                 lsxcommon::ModelRequest req{std::move(input_ids), 64};
                 auto result = model->Infer(req);
                 if (result.ok && !result.output_text.empty()) {
-                    int idx = 0;
+                    std::uint32_t idx = 0;
                     std::string_view rest = result.output_text;
                     while (!rest.empty()) {
-                        auto sp = rest.find(' ');
-                        std::string_view tok =
-                            (sp == rest.npos) ? rest : rest.substr(0, sp);
-                        bridge.Publish(lsxhome::MakeTokenPayload(
-                            0, static_cast<std::uint32_t>(idx++),
-                            std::string(tok).c_str()));
-                        rest.remove_prefix(sp == rest.npos ? rest.size()
-                                                           : sp + 1);
+                        std::string_view words[kMaxWordsPerChunk];
+                        const std::size_t n =
+                            lsxhome::SplitOnSpaces(rest, words, kMaxWordsPerChunk);
+                        for (std::size_t i = 0; i < n; ++i) {
+                            // A word longer than the payload's text field
+                            // would be cut mid-token; skip it loudly in the log
+                            // instead of publishing a truncated word.
+                            if (!lsxhome::TokenTextFits(words[i])) {
+                                lsxcommon::log::warn(absl::StrCat(
+                                    "skipping oversized token word (",
+                                    words[i].size(), " chars)"));
+                                continue;
+                            }
+                            bridge.Publish(lsxhome::MakeTokenPayload(
+                                lsxhome::kUnknownTokenId, idx++,
+                                std::string(words[i]).c_str()));
+                        }
+                        if (n == 0) break;
+                        // Resume past the word run we just consumed.
+                        rest.remove_prefix(words[n - 1].data() - rest.data() +
+                                           words[n - 1].size());
+                        while (!rest.empty() && rest.front() == ' ') {
+                            rest.remove_prefix(1);
+                        }
                     }
                     published = true;
                 }
@@ -116,9 +137,9 @@ void ComputeProducer(lsxhome::GuiBridge& bridge, std::atomic<bool>& running,
         }
     }
     if (!published) {
-        bridge.Publish(lsxhome::MakeTokenPayload(
-            kParisTokenId, 0,
-            prompt.empty() ? "Paris" : prompt.c_str()));
+        // No model output. Either nothing was requested (self-check token) or a
+        // requested model failed (echo the prompt, untagged).
+        bridge.Publish(lsxhome::MakeFallbackTokenPayload(prompt, !model_path.empty()));
     }
 
     // Keep the compute thread alive until the shell tears down; the UI thread
@@ -201,6 +222,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         if (!renderer.BeginFrame()) {
+            // No renderable back buffer (e.g. a resize that D3D12 refused while
+            // the window was minimized). Yield instead of spinning at 100% CPU;
+            // the next WM_SIZE restores the swap chain.
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
             continue;
         }
         lsxhome::ApplyBlackwellCoworkTheme();

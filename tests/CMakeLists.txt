@@ -29,3 +29,12 @@ endforeach()
 add_test(NAME test_lsxhome_gui COMMAND test_lsxhome_gui)
 add_test(NAME test_lsxhome_font COMMAND test_lsxhome_font)
 set_tests_properties(test_lsxhome_gui test_lsxhome_font PROPERTIES LABELS fast)
+
+# ── Build-system tests ───────────────────────────────────────────────────────
+# The after-fetch patches rewrite pinned third-party sources in place. When a
+# dependency bump moves the patched line, a silent no-op turns into a confusing
+# compile error far from the patch, so the helper refuses to continue.
+add_test(NAME patch_drift_guard
+    COMMAND ${CMAKE_COMMAND}
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_drift_guard_test.cmake")
+set_tests_properties(patch_drift_guard PROPERTIES LABELS fast)

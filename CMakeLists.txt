@@ -40,10 +40,18 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 include(FetchContent)
 
+# ── After-fetch patch helper ─────────────────────────────────────────────────
+# Used by every vendored dependency lsxhome patches in place below (the engine,
+# ImNodes, FreeType). lsxhome_replace_in_file rewrites each key exactly once and
+# refuses to run silently when a pinned dependency moves a patched line — see
+# the module for the drift-vs-already-applied contract and
+# tests/cmake/patch_drift_guard_test.cmake.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_vendored_sources.cmake)
+
 # ── Engine: pinned logestix checkout ─────────────────────────────────────────
 # The pin is a full commit SHA (logestix has no release tags). GIT_SHALLOW is
 # FALSE because a raw SHA cannot be fetched shallowly.
-set(LSXHOME_LOGESTIX_TAG "8b2f986b068d5c4b7254ea5b079587bc8797f761" CACHE STRING "logestix commit SHA the engine is pinned to")
+set(LSXHOME_LOGESTIX_TAG "7c03e1258dbb6d33eddf590e68320dadf572a2e9" CACHE STRING "logestix commit SHA the engine is pinned to")
 set(LSXHOME_LOGESTIX_SOURCE_DIR "" CACHE PATH "Local logestix checkout (development override)")
 
 # Build only the engine library from logestix — never its sibling applications,
@@ -62,16 +70,14 @@ else()
         GIT_TAG        "${LSXHOME_LOGESTIX_TAG}"
         GIT_SHALLOW    FALSE
     )
-    # Populate first so the Windows/subproject compatibility patches can be
-    # applied before the engine's CMakeLists is executed — MakeAvailable would
-    # configure the engine immediately. Same after-fetch pattern as ImNodes
-    # and FreeType below.
+    # Populate first so the CUDA 13.4 Debug patch can be applied before the
+    # engine's CMakeLists is executed — MakeAvailable would configure the engine
+    # immediately.
     FetchContent_GetProperties(logestix)
     if(NOT logestix_POPULATED)
         FetchContent_Populate(logestix)
     endif()
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_logestix_subproject.cmake)
-    lsxhome_patch_logestix_subproject("${logestix_SOURCE_DIR}")
+    lsxhome_patch_logestix("${logestix_SOURCE_DIR}")
     add_subdirectory("${logestix_SOURCE_DIR}" "${FETCHCONTENT_BASE_DIR}/logestix-build")
 endif()
 
@@ -89,7 +95,7 @@ endif()
 set(LSXHOME_LIBZMQ_SOURCE_DIR "${LSXHOME_LOGESTIX_DIR}/third_party/libzmq")
 
 # ── Dear ImGui docking branch (D3D12 + FreeType subpixel) ───────────────────
-set(LSXHOME_IMGUI_TAG v1.92.9-docking CACHE STRING "Dear ImGui docking-branch tag")
+set(LSXHOME_IMGUI_TAG v1.92.9b-docking CACHE STRING "Dear ImGui docking-branch tag")
 FetchContent_Declare(
     dear-imgui
     GIT_REPOSITORY "https://github.com/ocornut/imgui.git"
@@ -130,18 +136,10 @@ endif()
 # ImNodes v0.5 predates Dear ImGui 1.92's texture-refactoring: ImDrawCmd::TextureId
 # became ImTextureRef TexRef and ImDrawList::_TextureIdStack became _TextureStack.
 # Patch the vendored source (same pattern as the Arrow/Boost patches) so the
-# node editor compiles against the docking imgui.1.92.9.
-set(_imnodes_cpp "${imnodes_SOURCE_DIR}/imnodes.cpp")
-if(EXISTS "${_imnodes_cpp}")
-    file(READ "${_imnodes_cpp}" _imnodes_content)
-    string(REPLACE
-        "draw_cmd.TextureId = draw_list->_TextureIdStack.back();"
-        "draw_cmd.TexRef = draw_list->_TextureStack.back();"
-        _imnodes_content "${_imnodes_content}")
-    file(WRITE "${_imnodes_cpp}" "${_imnodes_content}")
-    unset(_imnodes_content)
-endif()
-unset(_imnodes_cpp)
+# node editor compiles against the docking imgui.1.92.9b.
+lsxhome_replace_in_file("${imnodes_SOURCE_DIR}/imnodes.cpp"
+    "draw_cmd.TextureId = draw_list->_TextureIdStack.back();"
+    "draw_cmd.TexRef = draw_list->_TextureStack.back();")
 
 # ── FreeType (imgui_freetype abstraction layer, LCD subpixel AA) ────────────
 set(LSXHOME_FREETYPE_TAG VER-2-14-3 CACHE STRING "FreeType tag")
@@ -160,17 +158,10 @@ endif()
 # ftoption.h (was disabled for patents). imgui_freetype baboon-fed subpixel
 # glyphs need pixel-LCD rendering, so unmute the define — the same patch-
 # after-fetch pattern as the Arrow/Boost patch in the engine.
-set(FT_CONFIG_OPTION_SUBPIXEL_FILE "${freetype_SOURCE_DIR}/include/freetype/config/ftoption.h")
-if(EXISTS "${FT_CONFIG_OPTION_SUBPIXEL_FILE}")
-    file(READ "${FT_CONFIG_OPTION_SUBPIXEL_FILE}" FT_OPTION_CONTENT)
-    string(REPLACE
-        "/* #define FT_CONFIG_OPTION_SUBPIXEL_RENDERING */"
-        "#define FT_CONFIG_OPTION_SUBPIXEL_RENDERING"
-        FT_OPTION_CONTENT "${FT_OPTION_CONTENT}")
-    file(WRITE "${FT_CONFIG_OPTION_SUBPIXEL_FILE}" "${FT_OPTION_CONTENT}")
-    unset(FT_OPTION_CONTENT)
-endif()
-unset(FT_CONFIG_OPTION_SUBPIXEL_FILE)
+lsxhome_replace_in_file(
+    "${freetype_SOURCE_DIR}/include/freetype/config/ftoption.h"
+    "/* #define FT_CONFIG_OPTION_SUBPIXEL_RENDERING */"
+    "#define FT_CONFIG_OPTION_SUBPIXEL_RENDERING")
 
 # Freetype targets must be static and must not pull system codec discovery
 # (zlib/harfbuzz/brotli/png) — the GUI rasterizer only needs TrueType+LCD.

@@ -21,7 +21,7 @@ satisfying MPL-2.0 section 3.2(a) for the statically linked engine.
 
 | Component | Version | License | Usage |
 |---|---|---|---|
-| Dear ImGui | v1.92.9-docking | MIT | runtime (D3D12 + Win32 backend) |
+| Dear ImGui | v1.92.9b-docking | MIT | runtime (D3D12 + Win32 backend) |
 | ImPlot | v1.0 | MIT | runtime (charts) |
 | ImNodes | v0.5 | MIT | runtime (node editor) |
 | FreeType | 2.14.3 | FreeType License (FTL) | runtime (font rasterizer) |
@@ -37,7 +37,7 @@ canonical text is reproduced at the end of this section.
 
 | Component | Copyright |
 |---|---|
-| Dear ImGui v1.92.9-docking | Copyright (c) 2014-2024 Omar Cornut |
+| Dear ImGui v1.92.9b-docking | Copyright (c) 2014-2024 Omar Cornut |
 | ImPlot v1.0 | Copyright (c) 2020 Evan Pezent |
 | ImNodes v0.5 | Copyright (c) 2021 Johann Muszynski |
 

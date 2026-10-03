@@ -54,7 +54,12 @@ public:
     bool TryPush(const T& item) noexcept {
         const std::size_t n = head_.load(std::memory_order_relaxed);
         const std::size_t slot = n & kMask;
-        if (slots_[slot].seq.load(std::memory_order_acquire) < n) {
+        // A slot is free for the producer at position n exactly when its
+        // sequence equals n (the consumer publishes n + Capacity on release).
+        // Anything else means the slot is still owned by the consumer, so the
+        // comparison is exact rather than an ordering: "< n" would also accept a
+        // slot whose counter had wrapped past n.
+        if (slots_[slot].seq.load(std::memory_order_acquire) != n) {
             return false;
         }
         slots_[slot].item = item;
@@ -84,7 +89,7 @@ public:
 
     bool Full() const noexcept {
         const std::size_t n = head_.load(std::memory_order_relaxed);
-        return slots_[n & kMask].seq.load(std::memory_order_acquire) < n;
+        return slots_[n & kMask].seq.load(std::memory_order_acquire) != n;
     }
 
     static constexpr std::size_t Capacity() noexcept { return kCapacity; }

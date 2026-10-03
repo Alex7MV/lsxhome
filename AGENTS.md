@@ -19,8 +19,8 @@ hosts. `linux-check` exists only to verify that no-op path.
 
 | Dependency | Version | Source | License | Type |
 |---|---|---|---|---|
-| logestix (`lsxcommon`) | pinned SHA `8b2f986b…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
-| Dear ImGui | `v1.92.9-docking` | FetchContent | MIT | Static (`lsxhome_imgui`) |
+| logestix (`lsxcommon`) | pinned SHA `7c03e12…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
+| Dear ImGui | `v1.92.9b-docking` | FetchContent | MIT | Static (`lsxhome_imgui`) |
 | ImPlot | `v1.0` | FetchContent | MIT | Static (`lsxhome_implot`) |
 | ImNodes | `v0.5` | FetchContent | MIT | Static (`lsxhome_imnodes`) |
 | FreeType | `VER-2-14-3` | FetchContent | FTL (of FTL/GPLv2) | Static |
@@ -51,21 +51,31 @@ cmake --build --preset windows-release
 `BUILD_TESTING=ON` in the Windows presets; Catch2 v3.16.0 via FetchContent.
 Tests are Windows-only (they link `lsxcommon`), label `fast`:
 
-- `test_lsxhome_gui` — `TokenPayload` layout, SPSC bridge round-trip /
-  backpressure / zero-allocation invariants.
+- `test_lsxhome_gui` — `TokenPayload` layout and producer clock stamp, SPSC
+  bridge round-trip / backpressure / zero-allocation invariants, refused-drain
+  safety, fallback-token labelling, token-text capacity, space-splitting of
+  generated text, SRV descriptor slot recycling, back-buffer install/invalidate
+  bookkeeping.
 - `test_lsxhome_font` — the embedded JetBrains Mono payload is non-empty and a
   valid TrueType container.
+- `patch_drift_guard` — the after-fetch patch helper rewrites a live key,
+  refuses a drifted key, and never re-wraps or skips a self-nested key.
 
-There is no headless ImGui harness; GUI rendering is not unit-tested.
+There is no headless ImGui harness; GUI rendering is not unit-tested. Device-side
+D3D12 work (swap-chain resize, descriptor-handle arithmetic) stays untested —
+only its slot bookkeeping is factored into `srv_descriptor_pool.h` so the
+alloc/free contract is verifiable without a GPU.
 
 ## Structure
 
 - `src/` — `main_win32.cpp` (WinMain + compute producer thread), `d3d12_renderer.cpp`,
   `font_loader.cpp`, `gui_renderer.cpp` (Blackwell/Cowork theme + welcome interface).
 - `include/lsxhome/` — `d3d12_renderer.h`, `font_loader.h`, `gui_bridge.h`,
-  `spsc_token_ring.h`, `blackwell_theme.h`, `gui_renderer.h`,
+  `spsc_token_ring.h`, `srv_descriptor_pool.h`, `swapchain_targets.h`,
+  `text_splitter.h`, `blackwell_theme.h`, `gui_renderer.h`,
   `imnodes_offsetof_shim.h`.
 - `cmake/` — `embed_binary.cmake` + `embed_font.ps1` (TTF → byte-array TU),
+  `patch_vendored_sources.cmake` (after-fetch rewrite helper),
   `copy_libzmq_source.cmake` (Release MPL-2.0 source bundle).
 - `assets/` — embedded fonts and their license texts.
 - `tests/` — Catch2 suite (label `fast`).
@@ -81,9 +91,35 @@ There is no headless ImGui harness; GUI rendering is not unit-tested.
 - The GUI stack is built as separate static archives; `lsxhome_imgui` exposes
   `IMGUI_DEFINE_MATH_OPERATORS` PUBLIC. `IMGUI_DISABLE_OBSOLETE_FUNCTIONS` is
   deliberately NOT used (struct-layout desync across TUs).
-- After-fetch patches (same pattern as the engine's Arrow/Boost patches):
-  ImNodes v0.5 `ImDrawCmd::TextureId` → `TexRef`; FreeType
-  `FT_CONFIG_OPTION_SUBPIXEL_RENDERING` unmuted for imgui_freetype LCD glyphs.
+- The engine needs exactly **one** patch (CUDA 13.4 Debug guard, below). At its
+  pinned SHA everything else already works as a CMake subproject on Windows: its
+  POSIX-only calls are guarded upstream (`setenv` in `kimi_moe_inference.cu` since
+  `bbf6771`), the `${CMAKE_SOURCE_DIR}/third_party` paths became
+  `PROJECT_SOURCE_DIR`, `M_PI` became `std::numbers::pi`, and `expert_store.h`
+  guards `munmap` itself. `7c03e12` additionally exports the NVCC options the
+  public headers require via an INTERFACE target, so consumers compiling their
+  own `.cu` no longer have to rediscover them.
+- Every after-fetch patch (engine, ImNodes, FreeType) goes through
+  `lsxhome_replace_in_file()` in `cmake/patch_vendored_sources.cmake`, which
+  rewrites each key exactly once and **hard-fails the configure** when a key is
+  neither present nor already applied — a stale key means the pin moved, never a
+  silent no-op. Contract: `tests/cmake/patch_drift_guard_test.cmake` (ctest
+  `patch_drift_guard`). Current patches: ImNodes v0.5 `ImDrawCmd::TextureId` →
+  `TexRef`, FreeType `FT_CONFIG_OPTION_SUBPIXEL_RENDERING` unmuted for
+  imgui_freetype LCD glyphs.
+- After-fetch patches must stay minimal, and a patch for an already-fixed issue
+  is worse than a harmless leftover: its key usually survives inside an upstream
+  `#else` branch, so the rewrite re-wraps the dependency's own fix on every
+  configure. The Kimi `setenv` patch did exactly that (five nested `#ifdef`
+  layers) before it was dropped. Re-verify necessity against
+  `git show <pin>:<file>` on the *pristine* checkout before adding a patch.
+- CUDA 13.4 caveat for any future `.cu` in this shell: `--expt-relaxed-constexpr`
+  plus `_DEBUG` (implied by `/MDd`) makes NVVM abort device codegen with
+  `parse Invalid instruction with no BB (Producer: 'LLVM23.0.0')` in
+  `perf_calibration.cu` and `gigachat_moe_inference_pipeline.cu`. The engine
+  passes the flag to its own TUs with no Debug guard, so the two upstream TUs
+  fail; lsxhome compiles only `.cpp` and is unaffected. Reproduced on
+  CUDA 13.4.92 / LLVM 23.
 - FreeType is static with zlib/bzip2/brotli/harfbuzz/png discovery disabled.
 - `lsx_embed_binary()` runs `embed_font.ps1` on Windows (linear-time byte
   emitter); the plain-CMake path is a slow fallback.

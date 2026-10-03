@@ -8,6 +8,8 @@
 
 #include "lsxhome/d3d12_renderer.h"
 
+#include "lsxhome/swapchain_targets.h"
+
 #include "backends/imgui_impl_dx12.h"
 #include "backends/imgui_impl_win32.h"
 #include <imgui.h>
@@ -21,7 +23,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -35,7 +36,9 @@ constexpr int kSrvPoolDescriptors = D3D12Renderer::kSrvPoolDescriptors;
 // ── SRV descriptor free-list allocator ─────────────────────────────────────
 // Carves descriptors out of the shader-visible CBV/SRV/UAV heap. The D3D12
 // backend pulls one slot for the free-type font-atlas texture and returns it
-// after the frame's fence completes (vanilla allocator equivalence).
+// after the frame's fence completes (vanilla allocator equivalence). Slot
+// bookkeeping lives in SrvDescriptorPool; this layer only converts slot
+// indices to descriptor handles.
 class SrvAllocator {
 public:
     void Create(ID3D12Device* device, ID3D12DescriptorHeap* heap) {
@@ -43,43 +46,46 @@ public:
         heap_ = heap;
         if (!heap_) return;
         const D3D12_DESCRIPTOR_HEAP_DESC desc = heap_->GetDesc();
-        capacity_ = static_cast<int>(std::min(desc.NumDescriptors,
-                                              static_cast<UINT>(kSrvPoolDescriptors)));
+        pool_.Reset(static_cast<int>(std::min(desc.NumDescriptors,
+                                              static_cast<UINT>(kSrvPoolDescriptors))));
         cpu_start_ = heap_->GetCPUDescriptorHandleForHeapStart();
         gpu_start_ = heap_->GetGPUDescriptorHandleForHeapStart();
         increment_ = device_->GetDescriptorHandleIncrementSize(desc.Type);
-        free_list_.clear();
-        for (int i = capacity_ - 1; i >= 0; --i) free_list_.push_back(i);
     }
 
     void Destroy() {
         heap_ = nullptr;
         device_ = nullptr;
-        free_list_.clear();
+        pool_.Reset(0);
     }
 
     bool Alloc(D3D12_CPU_DESCRIPTOR_HANDLE& cpu, D3D12_GPU_DESCRIPTOR_HANDLE& gpu) {
-        if (free_list_.empty()) return false;
-        const int idx = free_list_.back();
-        free_list_.pop_back();
-        cpu.ptr = cpu_start_.ptr + static_cast<UINT64>(idx) * increment_;
-        gpu.ptr = gpu_start_.ptr + static_cast<UINT64>(idx) * increment_;
+        // Zero the handles first: on exhaustion the backend must never carry
+        // an uninitialised descriptor into a draw call (NDEBUG builds compile
+        // the caller's assert out).
+        cpu.ptr = 0;
+        gpu.ptr = 0;
+        int index = -1;
+        if (!pool_.Alloc(index)) return false;
+        cpu.ptr = cpu_start_.ptr + static_cast<UINT64>(index) * increment_;
+        gpu.ptr = gpu_start_.ptr + static_cast<UINT64>(index) * increment_;
         return true;
     }
 
-    void Free(D3D12_GPU_DESCRIPTOR_HANDLE) {
-        // Slots recycle at the frame boundary; a free-notify bookkeeping pass
-        // is skipped here because the pool is drained per presentation frame.
+    void Free(D3D12_GPU_DESCRIPTOR_HANDLE gpu) {
+        if (!increment_ || gpu.ptr < gpu_start_.ptr) return;
+        const UINT64 offset = gpu.ptr - gpu_start_.ptr;
+        if (offset % increment_ != 0) return;
+        pool_.Free(static_cast<int>(offset / increment_));
     }
 
- private:
+private:
     ID3D12Device*         device_ = nullptr;
     ID3D12DescriptorHeap* heap_ = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_start_{};
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_start_{};
     UINT                  increment_ = 0;
-    int                   capacity_ = 0;
-    std::vector<int>      free_list_;
+    SrvDescriptorPool     pool_;
 };
 
 struct FrameCtx {
@@ -100,6 +106,7 @@ ComPtr<ID3D12Resource>             g_backbuffer[kNumBackBuffers];
 D3D12_CPU_DESCRIPTOR_HANDLE        g_rtv_handle[kNumBackBuffers];
 FrameCtx                           g_frame[kNumFrames];
 int                                g_frame_index = 0;
+SwapchainTargets                   g_targets;
 
 // ── Fence helpers ───────────────────────────────────────────────────────────
 void WaitFenceValue(ID3D12Fence* fence, UINT64 value) {
@@ -127,12 +134,14 @@ bool CreateDeviceTargets() {
         g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
     for (int i = 0; i < kNumBackBuffers; ++i) {
         if (FAILED(g_swapchain->GetBuffer(i, IID_PPV_ARGS(&g_backbuffer[i])))) {
+            g_targets.Invalidate();
             return false;
         }
         g_device->CreateRenderTargetView(g_backbuffer[i].Get(), nullptr, rtv);
         g_rtv_handle[i] = rtv;
         rtv.ptr += rtv_inc;
     }
+    g_targets.Install(kNumBackBuffers);
     return true;
 }
 
@@ -141,6 +150,7 @@ void CleanupRenderTargets() {
         g_backbuffer[i].Reset();
         g_rtv_handle[i].ptr = 0;
     }
+    g_targets.Invalidate();
 }
 
 bool CreateDeviceD3D(HWND hwnd) {
@@ -336,6 +346,9 @@ void D3D12Renderer::Shutdown() noexcept {
 
 bool D3D12Renderer::BeginFrame() noexcept {
     if (!initialized_) return false;
+    // A failed ResizeBuffers leaves no back buffers installed; refuse the frame
+    // instead of letting EndFrame build barriers against released resources.
+    if (g_targets.Installed() == 0) return false;
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -352,6 +365,9 @@ void D3D12Renderer::EndFrame(bool present) noexcept {
     WaitFenceValue(fc.fence.Get(), fc.fence_value);
 
     const UINT back_idx = g_swapchain->GetCurrentBackBufferIndex();
+    if (!g_targets.Ready(static_cast<int>(back_idx))) {
+        return;  // no back buffer to render into this frame
+    }
     ID3D12CommandAllocator* alloc = fc.allocator.Get();
     alloc->Reset();
     g_cmdlist->Reset(alloc, nullptr);
@@ -399,9 +415,16 @@ void D3D12Renderer::Resize(int width, int height) noexcept {
 
     WaitForAllFences();
     CleanupRenderTargets();
-    g_swapchain->ResizeBuffers(kNumBackBuffers, static_cast<UINT>(width_),
-                               static_cast<UINT>(height_), DXGI_FORMAT_UNKNOWN,
-                               0);
+    // ResizeBuffers fails while the swap chain still holds references (a
+    // minimized window, a device reset). Bail out with the pool invalidated:
+    // BeginFrame then refuses to render instead of the frame loop building a
+    // resource barrier against a released back buffer.
+    if (FAILED(g_swapchain->ResizeBuffers(kNumBackBuffers,
+                                          static_cast<UINT>(width_),
+                                          static_cast<UINT>(height_),
+                                          DXGI_FORMAT_UNKNOWN, 0))) {
+        return;
+    }
     CreateDeviceTargets();
 }
 
