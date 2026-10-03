@@ -6,10 +6,11 @@ Windows-native x64 desktop shell for the [logestix](https://github.com/Alex7MV/l
 synthesis core. C++20. CMake 3.25+ (`CMakePresets.json`), Visual Studio 18 2026
 generator on Windows.
 
-D3D12 + Dear ImGui (docking branch) immediate-mode stack. The engine's compute
-thread publishes decoded tokens into a lock-free SPSC `GuiBridge`; the UI thread
-drains them each frame. Strict separation: the UI thread never touches the model,
-the compute thread never touches the window.
+D3D12 + Dear ImGui (docking branch) immediate-mode stack. A `ChatSession`
+worker thread runs the engine and publishes decoded text into a lock-free SPSC
+`GuiBridge`; the UI thread drains them each frame into a `ChatState`
+transcript. Strict separation: the UI thread never touches the model, the worker
+thread never touches the window.
 
 Windows-only: on any other host the whole build is a no-op (early `return()` in
 `CMakeLists.txt`), so the tree configures cleanly on CI and Linux development
@@ -58,6 +59,15 @@ Tests are Windows-only (they link `lsxcommon`), label `fast`:
   bookkeeping.
 - `test_lsxhome_font` — the embedded JetBrains Mono payload is non-empty and a
   valid TrueType container.
+- `test_lsxhome_chat` — the chat MVP, engine-free (links Catch2 only, so it runs
+  without CUDA): `SplitUtf8Chunks` never splits a UTF-8 codepoint and honours
+  its capacity; `ChatState` turn/seq rules (busy and empty refusals, stale and
+  duplicate deltas, interrupted close, error line); `ChatSession` against a fake
+  `GenerationBackend` — submission, single `Prepare` across turns, multi-turn
+  history framing, mid-stream refusal, full-queue and oversized refusals, Stop
+  through the abort flag, `Prepare`/`Infer` failure phases, destructor join; and
+  the allocation-free drain of 1024 streamed chunks. The file is ASCII-only:
+  non-ASCII literals would be decoded through the compiler's source codepage.
 - `patch_drift_guard` — the after-fetch patch helper rewrites a live key,
   refuses a drifted key, and never re-wraps or skips a self-nested key.
 
@@ -68,12 +78,14 @@ alloc/free contract is verifiable without a GPU.
 
 ## Structure
 
-- `src/` — `main_win32.cpp` (WinMain + compute producer thread), `d3d12_renderer.cpp`,
-  `font_loader.cpp`, `gui_renderer.cpp` (Blackwell/Cowork theme + welcome interface).
+- `src/` — `main_win32.cpp` (WinMain + ChatSession wiring), `d3d12_renderer.cpp`,
+  `font_loader.cpp`, `gui_renderer.cpp` (Blackwell/Cowork theme + welcome/chat
+  panel), `lsx_generation_backend.cpp` (the only TU that includes `lsxcommon`).
 - `include/lsxhome/` — `d3d12_renderer.h`, `font_loader.h`, `gui_bridge.h`,
   `spsc_token_ring.h`, `srv_descriptor_pool.h`, `swapchain_targets.h`,
   `text_splitter.h`, `blackwell_theme.h`, `gui_renderer.h`,
-  `imnodes_offsetof_shim.h`.
+  `imnodes_offsetof_shim.h`, `chat_state.h`, `chat_session.h`,
+  `generation_backend.h`, `lsx_generation_backend.h`.
 - `cmake/` — `embed_binary.cmake` + `embed_font.ps1` (TTF → byte-array TU),
   `patch_vendored_sources.cmake` (after-fetch rewrite helper),
   `copy_libzmq_source.cmake` (Release MPL-2.0 source bundle).
@@ -146,6 +158,15 @@ alloc/free contract is verifiable without a GPU.
   the norm, and CMake scripts carry explanatory comments.
 - Keep `THIRD_PARTY_NOTICES` and `README.md` in sync when adding or bumping a
   dependency.
+- The chat path is engine-free by construction: `chat_state.h`,
+  `chat_session.h` and `generation_backend.h` must not include `lsxcommon` or
+  ImGui, and `lsx_generation_backend.cpp` is the only place allowed to translate
+  between the two vocabularies. That boundary is what lets
+  `test_lsxhome_chat` run without CUDA — breaking it silently costs the
+  headless suite.
+- `ChatSession::Busy()` (queued or running turns) is the UI's "a turn is in
+  flight" gate; `phase() == kIdle` is not, because a freshly queued question has
+  not reached the worker yet.
 
 ## Subagent policy
 

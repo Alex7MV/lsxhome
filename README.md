@@ -17,12 +17,31 @@ cleanly anywhere.
 CMakeLists.txt        top-level build (Windows-only)
 CMakePresets.json     windows-debug / windows-release / linux-check
 cmake/                font/asset embedding helpers
-src/                  main_win32, d3d12_renderer, font_loader, gui_renderer
-include/lsxhome/      blackwell_theme, d3d12_renderer, font_loader,
-                      gui_bridge, gui_renderer, spsc_token_ring, imnodes shim
+src/                  main_win32, d3d12_renderer, font_loader, gui_renderer,
+                      lsx_generation_backend
+include/lsxhome/      blackwell_theme, chat_session, chat_state, d3d12_renderer,
+                      font_loader, generation_backend, gui_bridge, gui_renderer,
+                      lsx_generation_backend, spsc_token_ring, imnodes shim
 assets/               embedded TrueType fonts (Inter, JetBrains Mono)
-tests/                test_lsxhome_gui, test_lsxhome_font (label `fast`)
+tests/                test_lsxhome_chat, test_lsxhome_font, test_lsxhome_gui
+                      (label `fast`)
 ```
+
+## Chat
+
+The main panel is a chat surface: type a question (Enter or **Send**), and the
+logestix engine answers it token by token. **Stop** interrupts a running
+generation, and every exchange is framed back to the model, so follow-up
+questions keep their context. The model path comes from `--model`; the model
+picker in the UI is still a stub. `--run [PROMPT]` submits its prompt as the
+first chat turn (with no `--model` it shows the deterministic GLM-5.2
+self-check token instead).
+
+Threading: `ChatSession` owns a worker thread and a lock-free request ring; it
+runs the engine and publishes decoded text into the `GuiBridge`. The UI thread
+drains the bridge into a `ChatState` transcript every frame and never touches
+the model. `chat_state.h` / `chat_session.h` are engine-free by construction,
+which is why `test_lsxhome_chat` links Catch2 alone and runs without CUDA.
 
 ## Engine dependency
 
