@@ -515,3 +515,25 @@ TEST_CASE("lsxhome: a failed generation closes the reply as interrupted",
     REQUIRE(state.messages()[1].interrupted);
     REQUIRE(state.messages()[1].text == "partial answer");
 }
+
+TEST_CASE("lsxhome: draining streamed chunks never allocates", "[lsxhome][chat]") {
+    lsxhome::GuiBridge bridge;
+    FakeBackend backend;  // never invoked: the chunks are published directly
+    lsxhome::ChatSession session(bridge, backend);
+
+    lsxhome::ChatState state;
+    REQUIRE(state.BeginTurn("question"));
+
+    constexpr std::uint32_t kChunks = 1024;
+    for (std::uint32_t seq = 0; seq < kChunks; ++seq) {
+        REQUIRE(bridge.Publish(lsxhome::MakeTokenPayload(
+            lsxhome::kUnknownTokenId, seq, "x")));
+    }
+
+    const long long before = g_alloc_count.load(std::memory_order_relaxed);
+    session.DrainInto(state);
+    const long long after = g_alloc_count.load(std::memory_order_relaxed);
+
+    REQUIRE(after - before == 0);
+    REQUIRE(state.messages()[1].text.size() == kChunks);
+}
