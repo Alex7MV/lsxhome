@@ -1,39 +1,31 @@
 // lsxhome (LogestiX Home) — Windows-native x64 desktop shell.
 //
 // Lifecycle: WinMain -> native window -> D3D12 hardware renderer + Dear ImGui
-// (docking branch); a compute thread publishes decoded tokens into the
-// lock-free SPSC GuiBridge; the UI thread drains them every frame and renders
-// the Cowork-style Blackwell theme. Strict separation: the UI thread never
-// touches the model, and the compute thread never touches the window.
+// (docking branch); a ChatSession worker thread runs the logestix engine and
+// publishes decoded text into the lock-free SPSC GuiBridge; the UI thread
+// drains it every frame into the chat transcript. Strict separation: the UI
+// thread never touches the model, and the worker never touches the window.
 
 #include "backends/imgui_impl_win32.h"
 #include <imgui.h>
 
+#include "lsxhome/chat_session.h"
+#include "lsxhome/chat_state.h"
 #include "lsxhome/d3d12_renderer.h"
 #include "lsxhome/font_loader.h"
 #include "lsxhome/gui_bridge.h"
 #include "lsxhome/gui_renderer.h"
-#include "lsxhome/text_splitter.h"
+#include "lsxhome/lsx_generation_backend.h"
 
 #include "lsxcommon/generation_cli.h"
-#include "lsxcommon/log.h"
-#include "lsxcommon/model.h"
-#include "lsxcommon/model_engine.h"
-#include "lsxcommon/model_factory.h"
-#include "lsxcommon/prompt_framing.h"
 
 #include <absl/flags/flag.h>
 #include <absl/flags/parse.h>
-#include <absl/strings/str_cat.h>
 
 #include <windows.h>
 
-#include <atomic>
 #include <cstdint>
-#include <cstdlib>
-#include <functional>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -56,10 +48,6 @@ constexpr const wchar_t* kWindowTitle = L"lsxhome — LogestiX Home";
 constexpr int kDefaultWidth = 1440;
 constexpr int kDefaultHeight = 900;
 
-// Words consumed from one chunk of generated text per splitter call. Bounded so
-// the stack view array in the producer loop stays fixed-size.
-constexpr std::size_t kMaxWordsPerChunk = 64;
-
 lsxhome::D3D12Renderer* g_renderer = nullptr;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -78,77 +66,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
-
-void ComputeProducer(lsxhome::GuiBridge& bridge, std::atomic<bool>& running,
-                     const std::string& model_path,
-                     const std::string& prompt) {
-    bool published = false;
-    // Runs the resolved generation prompt through the model once and publishes
-    // each decoded word into the SPSC bridge. When no model was requested there
-    // is nothing to run, so MakeFallbackTokenPayload emits the deterministic
-    // GLM-5.2 self-check token (11751 -> "Paris") instead.
-    if (!model_path.empty()) {
-        // Fixed-speed policy: the engine session applies the per-GPU knob
-        // policy (same as lsxfabric/lsxbenchmark) on entry and tears the
-        // engine down on scope exit.
-        lsxcommon::InferenceEngine::Session engine_session;
-        lsxcommon::ModelInitConfig cfg;
-        cfg.model_path = model_path;
-        auto model = lsxcommon::LsxModelFactory::Create(cfg);
-        if (model && model->Load()) {
-            std::vector<int32_t> input_ids;
-            if (model->BuildPromptInputIds(
-                    model->Tokenizer(), prompt, input_ids)) {
-                lsxcommon::ModelRequest req{std::move(input_ids), 64};
-                auto result = model->Infer(req);
-                if (result.ok && !result.output_text.empty()) {
-                    std::uint32_t idx = 0;
-                    std::string_view rest = result.output_text;
-                    while (!rest.empty()) {
-                        std::string_view words[kMaxWordsPerChunk];
-                        const std::size_t n =
-                            lsxhome::SplitOnSpaces(rest, words, kMaxWordsPerChunk);
-                        for (std::size_t i = 0; i < n; ++i) {
-                            // A word longer than the payload's text field
-                            // would be cut mid-token; skip it loudly in the log
-                            // instead of publishing a truncated word.
-                            if (!lsxhome::TokenTextFits(words[i])) {
-                                lsxcommon::log::warn(absl::StrCat(
-                                    "skipping oversized token word (",
-                                    words[i].size(), " chars)"));
-                                continue;
-                            }
-                            bridge.Publish(lsxhome::MakeTokenPayload(
-                                lsxhome::kUnknownTokenId, idx++,
-                                std::string(words[i]).c_str()));
-                        }
-                        if (n == 0) break;
-                        // Resume past the word run we just consumed.
-                        rest.remove_prefix(words[n - 1].data() - rest.data() +
-                                           words[n - 1].size());
-                        while (!rest.empty() && rest.front() == ' ') {
-                            rest.remove_prefix(1);
-                        }
-                    }
-                    published = true;
-                }
-            }
-            model->Unload();
-        }
-    }
-    if (!published) {
-        // No model output. Either nothing was requested (self-check token) or a
-        // requested model failed (echo the prompt, untagged).
-        bridge.Publish(lsxhome::MakeFallbackTokenPayload(prompt, !model_path.empty()));
-    }
-
-    // Keep the compute thread alive until the shell tears down; the UI thread
-    // drains the already-published token stream every frame.
-    while (running.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
-    }
-}
-
 }  // namespace
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
@@ -206,10 +123,28 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     lsxhome::SetHeadingFont(lsxhome::FontLoader::LoadHeading(*io.Fonts));
 
     lsxhome::GuiBridge bridge;
-    std::atomic<bool> running{true};
-    std::thread compute_thread(
-        ComputeProducer, std::ref(bridge), std::ref(running),
-        model_path, run_prompt);
+    auto backend = lsxhome::MakeLsxGenerationBackend(model_path);
+    lsxhome::ChatSession session(bridge, *backend);
+    lsxhome::ChatState chat;
+
+    // --run keeps its CLI contract: the resolved prompt is submitted as the first
+    // chat turn. With no --model there is nothing to run, so the deterministic
+    // GLM-5.2 self-check token (11751 -> "Paris") becomes the answer instead of
+    // starting a load that cannot succeed. The self-check goes straight into the
+    // transcript: publishing it through the bridge would make the UI thread a
+    // second producer on a single-producer ring.
+    if (!absl::GetFlag(FLAGS_run).empty()) {
+        if (model_path.empty()) {
+            const lsxhome::TokenPayload self_check =
+                lsxhome::MakeFallbackTokenPayload(run_prompt, false);
+            if (chat.BeginTurn(run_prompt)) {
+                chat.AppendDelta(self_check.stream_seq, self_check.text);
+                chat.EndTurn(false);
+            }
+        } else if (session.Submit(run_prompt)) {
+            chat.BeginTurn(run_prompt);
+        }
+    }
 
     MSG msg = {};
     while (msg.message != WM_QUIT) {
@@ -230,17 +165,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         }
         lsxhome::ApplyBlackwellCoworkTheme();
 
-        // Edge-to-edge docking root + seamless sidebar/panel layout.
-        lsxhome::BuildWorkspaceSkeleton(bridge);
+        // Edge-to-edge docking root + chat panel; the panel drains the bridge into
+        // the transcript every frame.
+        lsxhome::BuildWorkspaceSkeleton(session, chat);
 
         renderer.EndFrame(true);
     }
 
-    running.store(false, std::memory_order_relaxed);
-    if (compute_thread.joinable()) {
-        compute_thread.join();
-    }
-
+    // The ChatSession destructor aborts and joins its worker, which unloads the
+    // model with the engine session it owns.
     renderer.Shutdown();
     g_renderer = nullptr;
     UnregisterClassW(kWindowClass, hInst);

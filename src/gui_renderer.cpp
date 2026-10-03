@@ -11,12 +11,11 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
-#include "lsxcommon/log.h"
-
-#include <absl/strings/str_cat.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 
 namespace lsxhome {
 namespace {
@@ -44,7 +43,27 @@ constexpr ImU32 kTextU32         = IM_COL32(225, 225, 235, 255);
 constexpr ImU32 kCardBgU32       = IM_COL32( 26,  26,  26, 255);  // ~0.10 alpha grey
 constexpr ImU32 kCardBgHoverU32  = IM_COL32( 42,  42,  42, 255);
 
+// ── Chat panel geometry and accents (kept local) ────────────────────────────
+constexpr float kChatFormH   = 132.0f;  // height reserved for the pinned form
+constexpr float kChatSendW   = 96.0f;
+constexpr float kChatGap     = 12.0f;
+constexpr float kChatFieldH  = 64.0f;
+
+constexpr ImU32 kUserTextU32  = IM_COL32(160, 158, 178, 255);
+constexpr ImU32 kStoppedU32   = IM_COL32(148, 148, 158, 255);
+constexpr ImU32 kErrorU32     = IM_COL32(226, 108,  92, 255);
+constexpr ImU32 kLoadingU32   = IM_COL32(148, 148, 158, 255);
+
+// ImGui widgets take an ImVec4; the packed accents above are for draw lists.
+ImVec4 WidgetColor(ImU32 packed) noexcept {
+    return ImGui::ColorConvertU32ToFloat4(packed);
+}
+
 ImFont* g_heading_font = nullptr;
+
+// The question draft lives in file scope so it survives a refused Submit (a
+// full queue keeps the text for the next attempt).
+char g_question[lsxhome::ChatSession::kMaxPromptChars] = "";
 
 void DrawAsterisk(ImDrawList* dl, ImVec2 c, float r, float t, ImU32 col) noexcept {
     // Three full lines through the centre at 60deg -> a six-ray asterisk with
@@ -116,13 +135,117 @@ void DrawMCPTools(ImDrawList* dl, const ImVec2& pos, ImVec2 size, const char* la
     }
 }
 
+const char* PhaseLabel(lsxhome::ChatPhase phase) noexcept {
+    switch (phase) {
+        case lsxhome::ChatPhase::kIdle:       return "idle";
+        case lsxhome::ChatPhase::kLoading:    return "loading the model";
+        case lsxhome::ChatPhase::kGenerating: return "generating";
+        case lsxhome::ChatPhase::kError:      return "error";
+    }
+    return "idle";
+}
+
+// The shared question widget: the welcome card and the pinned chat form render
+// the same input, so both can submit the same draft.
+bool DrawQuestionInput(float width, float height, bool transparent_bg) noexcept {
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, kWelcomeRound);
+    ImGui::PushStyleColor(
+        ImGuiCol_FrameBg,
+        transparent_bg ? ImVec4(0.0f, 0.0f, 0.0f, 0.0f)
+                       : MakeVec4(0.10f, 0.10f, 0.10f, 1.00f));
+    // Enter submits; Shift+Enter still inserts a newline (ImGui checks the shift
+    // state before EnterReturnsTrue).
+    const bool entered = ImGui::InputTextMultiline(
+        "##question", g_question, IM_ARRAYSIZE(g_question),
+        ImVec2(width, height),
+        ImGuiInputTextFlags_EnterReturnsTrue |
+            ImGuiInputTextFlags_NoHorizontalScroll);
+    ImGui::PopStyleColor(1);
+    ImGui::PopStyleVar(1);
+    return entered;
+}
+
+/// Send / Stop. Returns true only for a real send press: while a turn is in
+/// flight the same button stops it, and a stop is never a submit.
+bool DrawSendStopButton(lsxhome::ChatSession& session) noexcept {
+    // Busy (not phase) is the gate: a queued question has not reached the worker
+    // yet, so its phase is still kIdle.
+    if (session.Busy()) {
+        if (ImGui::Button("Stop", ImVec2(kChatSendW, 0.0f))) {
+            session.RequestStop();
+        }
+        return false;
+    }
+    return ImGui::Button("Send", ImVec2(kChatSendW, 0.0f));
+}
+
+void DrawStatusLines(const lsxhome::ChatSession& session,
+                     const lsxhome::ChatState& state) noexcept {
+    if (session.phase() == lsxhome::ChatPhase::kLoading) {
+        ImGui::TextColored(WidgetColor(kLoadingU32), "Loading the model...");
+    }
+    if (!session.error().empty()) {
+        ImGui::TextColored(WidgetColor(kErrorU32), "%s", session.error().c_str());
+    }
+    if (!state.error().empty()) {
+        ImGui::TextColored(WidgetColor(kErrorU32), "%s", state.error().c_str());
+    }
+}
+
+void SubmitDraft(lsxhome::ChatSession& session, lsxhome::ChatState& state,
+                 bool requested) noexcept {
+    if (!requested || session.Busy() || g_question[0] == '\0') {
+        return;
+    }
+    // Queue first: a refused Submit (full queue / oversized question) must leave
+    // the transcript untouched and keep the draft for the next attempt.
+    if (!session.Submit(g_question)) {
+        return;
+    }
+    state.BeginTurn(g_question);
+    g_question[0] = '\0';
+}
+
+void DrawTranscript(const lsxhome::ChatState& state) noexcept {
+    for (const lsxhome::ChatMessage& message : state.messages()) {
+        const bool is_user = message.role == "user";
+        ImGui::PushStyleColor(ImGuiCol_Text, is_user ? kUserTextU32 : kTextU32);
+        ImGui::TextUnformatted(is_user ? "You" : "LogestiX");
+        ImGui::PopStyleColor();
+        ImGui::TextWrapped("%s", message.text.c_str());
+        if (message.interrupted) {
+            ImGui::TextColored(WidgetColor(kStoppedU32), "- stopped");
+        }
+        ImGui::Separator();
+    }
+    // Follow the tail, but never yank the view away from a user who scrolled up.
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+}
+
+void DrawChatForm(lsxhome::ChatSession& session, lsxhome::ChatState& state) noexcept {
+    const float field_w =
+        ImGui::GetContentRegionAvail().x - kChatSendW - kChatGap;
+    const bool typed_enter = DrawQuestionInput(field_w, kChatFieldH, false);
+    ImGui::SameLine();
+    const bool pressed_send = DrawSendStopButton(session);
+    DrawStatusLines(session, state);
+    SubmitDraft(session, state, typed_enter || pressed_send);
+}
+
 }  // namespace
+
+void PrefillQuestion(const char* text) noexcept {
+    std::snprintf(g_question, sizeof(g_question), "%s", text ? text : "");
+}
 
 void SetHeadingFont(ImFont* font) noexcept {
     g_heading_font = font;
 }
 
-void DrawClaudeWelcomeInterface() noexcept {
+static void DrawClaudeWelcomeInterface(lsxhome::ChatSession& session,
+                                       lsxhome::ChatState& state) noexcept {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
 
@@ -164,19 +287,13 @@ void DrawClaudeWelcomeInterface() noexcept {
         ImDrawList* child_dl = ImGui::GetWindowDrawList();
         const float bottom_row_h = 30.0f;
         const ImVec2 input_pos = ImGui::GetCursorScreenPos();
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, kWelcomeRound);
-        static char input_buf[512] = "";
-        ImGui::InputTextMultiline(
-            "##welcome_input", input_buf, IM_ARRAYSIZE(input_buf),
-            ImVec2(-1.0f, -bottom_row_h), ImGuiInputTextFlags_NoHorizontalScroll);
-        ImGui::PopStyleVar(1);
-        ImGui::PopStyleColor(1);
-        if (input_buf[0] == '\0') {
+        const bool typed_enter =
+            DrawQuestionInput(-1.0f, -bottom_row_h, /*transparent_bg=*/true);
+        if (g_question[0] == '\0') {
             child_dl->AddText(input_pos, kMutedU32, "How can Claude help you today?");
         }
 
-        // Bottom control row: model/style pickers left, MCP tools right.
+        // Bottom control row: model/style pickers left, MCP tools + Send right.
         const float row_y =
             ImGui::GetWindowPos().y + ImGui::GetWindowSize().y - bottom_row_h - 8.0f;
         ImGui::SetCursorScreenPos(ImVec2(ImGui::GetWindowPos().x + 14.0f, row_y));
@@ -187,12 +304,20 @@ void DrawClaudeWelcomeInterface() noexcept {
         const float fs3 = fs * 0.42f * 3.0f + 6.0f;
         const float mcp_w = fs3 + ImGui::CalcTextSize("28").x +
                             ImGui::CalcTextSize(mcp).x;
+        const float send_w =
+            ImGui::CalcTextSize(session.Busy() ? "Stop" : "Send").x + 20.0f;
         ImGui::SameLine(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x -
-                        mcp_w - 8.0f);
+                        mcp_w - send_w - kChatGap - 8.0f);
         DrawMCPTools(child_dl,
-                     ImVec2(ImGui::GetCursorScreenPos().x,
-                            row_y),
+                     ImVec2(ImGui::GetCursorScreenPos().x, row_y),
                      ImVec2(mcp_w, bottom_row_h), mcp);
+        ImGui::SameLine();
+        ImGui::SetCursorScreenPos(ImVec2(ImGui::GetWindowPos().x +
+                                             ImGui::GetWindowSize().x - send_w - 8.0f,
+                                         row_y));
+        const bool pressed_send = DrawSendStopButton(session);
+        DrawStatusLines(session, state);
+        SubmitDraft(session, state, typed_enter || pressed_send);
         ImGui::EndChild();
     }
     ImGui::PopStyleVar(3);
@@ -208,7 +333,18 @@ void DrawClaudeWelcomeInterface() noexcept {
     const char* labels[] = {"Provide stakeholder perspective",
                             "Extract insights from report",
                             "Polish your prose"};
+    static const char* quick_action_ids[] = {"##quick_action_0",
+                                             "##quick_action_1",
+                                             "##quick_action_2"};
     for (int i = 0; i < 3; ++i) {
+        // The button is invisible: the card below is drawn by hand, so only the
+        // hit-rectangle and the click test come from ImGui. A click prefills the
+        // question draft instead of firing a canned prompt.
+        ImGui::SetCursorScreenPos(ImVec2(cx, ay));
+        ImGui::InvisibleButton(quick_action_ids[i], card_size);
+        if (ImGui::IsItemClicked()) {
+            PrefillQuestion(labels[i]);
+        }
         DrawQuickActionCard(dl, ImVec2(cx, ay), card_size, labels[i]);
         cx += card_w + gap;
     }
@@ -260,7 +396,7 @@ void ApplyBlackwellCoworkTheme() noexcept {
     style.TabRounding = 6.0f;
 }
 
-void BuildWorkspaceSkeleton(GuiBridge& bridge) noexcept {
+void BuildWorkspaceSkeleton(ChatSession& session, ChatState& state) noexcept {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
 
     // Edge-to-edge root dock host. Covers the full viewport with zero chrome
@@ -289,34 +425,60 @@ void BuildWorkspaceSkeleton(GuiBridge& bridge) noexcept {
     {
         ImGui::TextUnformatted("LogestiX Home");
         ImGui::Separator();
-        ImGui::TextUnformatted("Sessions");
+        ImGui::TextUnformatted("Session");
 
         ImGui::Separator();
-        if (ImGui::Button("Drain pool")) {
-            TokenPayload buf[256];
-            const std::size_t n = bridge.DrainAll(buf, 256);
-            for (std::size_t i = 0; i < n; ++i) {
-                lsxcommon::log::info(absl::StrCat(
-                    "token id=", buf[i].token_id, " seq=", buf[i].stream_seq,
-                    " text=", buf[i].text));
-            }
-        }
+        // The chat panel is now the bridge's only consumer, so the old
+        // "Drain pool" button is gone: it would steal streamed chunks from the
+        // transcript. Telemetry stays.
+        ImGui::Text("Phase: %s", PhaseLabel(session.phase()));
         ImGui::Text("Published: %zu\nDropped: %zu\nPoolSlots: %zu",
-                    bridge.Published(), bridge.Dropped(),
+                    session.Published(), session.Dropped(),
                     GuiBridge::kPoolSlots);
+        if (ImGui::Button("Clear conversation")) {
+            state.Clear();
+        }
     }
     ImGui::EndChild();
 
     ImGui::SameLine();
 
-    // Main content: Claude-style welcome screen, seamless sibling block.
+    // Main content: welcome screen or conversation, seamless sibling block.
     ImGui::BeginChild("##main", ImVec2(0.0f, 0.0f), false);
     {
-        DrawClaudeWelcomeInterface();
+        DrawChatPanel(session, state);
     }
     ImGui::EndChild();
 
     ImGui::End();
+}
+
+void DrawChatPanel(ChatSession& session, ChatState& state) noexcept {
+    // Drain first: the worker publishes the last chunk before it reports the
+    // turn as finished, so a phase check that ran earlier would close the reply
+    // with its tail unread.
+    session.DrainInto(state);
+    if (state.Busy() && !session.Busy()) {
+        state.EndTurn(session.phase() == ChatPhase::kError
+                          ? true
+                          : session.TakeInterrupted());
+    }
+
+    if (state.empty()) {
+        DrawClaudeWelcomeInterface(session, state);
+        return;
+    }
+
+    if (ImGui::BeginChild("##transcript", ImVec2(0.0f, -kChatFormH), true)) {
+        DrawTranscript(state);
+    }
+    ImGui::EndChild();
+
+    ImGui::SetCursorScreenPos(
+        ImVec2(ImGui::GetWindowPos().x + 14.0f,
+               ImGui::GetWindowPos().y + ImGui::GetWindowSize().y -
+                   kChatFormH + 8.0f));
+    DrawChatForm(session, state);
 }
 
 }  // namespace lsxhome
