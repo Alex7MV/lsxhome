@@ -1914,6 +1914,22 @@ git commit -m "docs: document the chat MVP layout, tests and engine-free boundar
 
 ---
 
+## Execution notes (deviations found while implementing)
+
+1. **Test sources are ASCII-only.** `tests/test_lsxhome_chat.cpp` spells every
+   non-ASCII string as explicit UTF-8 bytes (`kHello`, `kWorld`, `kGlobe` in
+   Task 1). MSVC decodes a narrow literal through the compiler's source codepage,
+   which is not guaranteed to be UTF-8, so a literal "Привет" would make the
+   assertions test the toolchain instead of the chunker. Do not "fix" this by
+   inlining non-ASCII literals.
+2. **`SplitUtf8Chunks` widens any budget below 4**, so the capacity case must
+   pass `max_bytes = 4` (chunking "abcdefgh" into "abcd"/"efgh"); passing 2 and
+   expecting "ab"/"cd" contradicts the clamp that Task 1's third case pins.
+3. **Task 1 Step 4 test lists `chunks[0] == "ab"`** — replace with the values in
+   deviation 2 above when running the plan from scratch.
+
+---
+
 ## Self-Review
 
 **Spec coverage**
