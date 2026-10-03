@@ -3,6 +3,9 @@
 #include "lsxhome/blackwell_theme.h"
 #include "lsxhome/gui_bridge.h"
 #include "lsxhome/spsc_token_ring.h"
+#include "lsxhome/srv_descriptor_pool.h"
+#include "lsxhome/swapchain_targets.h"
+#include "lsxhome/text_splitter.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -11,9 +14,14 @@
 #include <thread>
 
 using lsxhome::GuiBridge;
+using lsxhome::MakeFallbackTokenPayload;
 using lsxhome::MakeTokenPayload;
 using lsxhome::SpscTokenRing;
+using lsxhome::SrvDescriptorPool;
+using lsxhome::SplitOnSpaces;
+using lsxhome::SwapchainTargets;
 using lsxhome::TokenPayload;
+using lsxhome::TokenTextFits;
 
 // Deterministic GLM-5.2 self-check token: 11751 decodes to "Paris".
 constexpr std::uint32_t kParisTokenId = 11751;
@@ -64,6 +72,172 @@ TEST_CASE("lsxhome: deterministic 11751->'Paris' round-trips through the bridge"
     REQUIRE(out.token_id == kParisTokenId);
     REQUIRE(out.stream_seq == 0);
     REQUIRE(std::strcmp(out.text, "Paris") == 0);
+}
+
+TEST_CASE("lsxhome: token payload carries a producer-side steady-clock stamp",
+          "[lsxhome][gui]") {
+    // ns_stamp is documented as the producer-side steady-clock stamp, so a
+    // freshly built payload must carry a real reading — never the zeroed
+    // default that would silently read as "no latency data".
+    const TokenPayload first = MakeTokenPayload(kParisTokenId, 0, "Paris");
+    REQUIRE(first.ns_stamp > 0);
+
+    // Stamps must advance with the producer, never move backwards.
+    const TokenPayload second = MakeTokenPayload(kParisTokenId, 1, "Paris");
+    REQUIRE(second.ns_stamp >= first.ns_stamp);
+}
+
+TEST_CASE("lsxhome: space splitting never emits empty words", "[lsxhome][text]") {
+    // The producer used to split on a bare ' ' scan, so a double space or a
+    // leading space published an empty token straight into the UI stream.
+    std::string_view words[8];
+
+    REQUIRE(SplitOnSpaces("alpha beta gamma", words, 8) == 3);
+    REQUIRE(words[0] == "alpha");
+    REQUIRE(words[1] == "beta");
+    REQUIRE(words[2] == "gamma");
+
+    REQUIRE(SplitOnSpaces("alpha  beta", words, 8) == 2);
+    REQUIRE(words[0] == "alpha");
+    REQUIRE(words[1] == "beta");
+
+    REQUIRE(SplitOnSpaces("   alpha", words, 8) == 1);
+    REQUIRE(words[0] == "alpha");
+
+    REQUIRE(SplitOnSpaces("alpha   ", words, 8) == 1);
+    REQUIRE(words[0] == "alpha");
+
+    // Whitespace-only and empty input yield no words at all.
+    REQUIRE(SplitOnSpaces("     ", words, 8) == 0);
+    REQUIRE(SplitOnSpaces("", words, 8) == 0);
+}
+
+TEST_CASE("lsxhome: space splitting honours the output capacity", "[lsxhome][text]") {
+    std::string_view words[2];
+    REQUIRE(SplitOnSpaces("a b c d", words, 2) == 2);
+    REQUIRE(words[0] == "a");
+    REQUIRE(words[1] == "b");
+
+    std::string_view none[1];
+    REQUIRE(SplitOnSpaces("a b", none, 0) == 0);
+}
+
+TEST_CASE("lsxhome: a refused drain neither writes nor loses tokens", "[lsxhome][gui]") {
+    // DrainAll wrote straight into the caller buffer, so a null destination
+    // was an access violation rather than a refusal.
+    GuiBridge bridge;
+    REQUIRE(bridge.Publish(MakeTokenPayload(kParisTokenId, 0, "Paris")));
+
+    REQUIRE(bridge.DrainAll(nullptr, 8) == 0);
+
+    // Refusing must not consume: the token is still available to the UI.
+    TokenPayload out;
+    REQUIRE(bridge.Poll(out));
+    REQUIRE(out.token_id == kParisTokenId);
+
+    TokenPayload buf[4];
+    REQUIRE(bridge.DrainAll(buf, 0) == 0);
+}
+
+TEST_CASE("lsxhome: callers can detect a token payload that would truncate",
+          "[lsxhome][gui]") {
+    // The payload is a fixed one-cache-line slot, so a long word is cut at
+    // runtime. MakeTokenPayload cannot report that through its signature, so
+    // the capacity has to be discoverable before the call.
+    REQUIRE(TokenTextFits(""));
+    REQUIRE(TokenTextFits("Paris"));
+
+    // 31 characters plus the NUL terminator exactly fills text[32].
+    const std::string longest(lsxhome::kTokenTextCapacity - 1, 'x');
+    REQUIRE(TokenTextFits(longest));
+
+    const std::string too_long(lsxhome::kTokenTextCapacity, 'x');
+    REQUIRE_FALSE(TokenTextFits(too_long));
+}
+
+TEST_CASE("lsxhome: a bare launch falls back to the Paris self-check token",
+          "[lsxhome][gui]") {
+    // No model was requested, so there is nothing to generate from: the shell
+    // publishes the deterministic GLM-5.2 self-check token. This used to be
+    // unreachable, because the prompt is never empty — ResolveGenerationPrompt
+    // substitutes the engine's default blueprint prompt.
+    const TokenPayload demo = MakeFallbackTokenPayload("", false);
+    REQUIRE(demo.token_id == 11751);
+    REQUIRE(std::strcmp(demo.text, "Paris") == 0);
+
+    const TokenPayload demo_with_default = MakeFallbackTokenPayload("blueprint", false);
+    REQUIRE(demo_with_default.token_id == 11751);
+    REQUIRE(std::strcmp(demo_with_default.text, "Paris") == 0);
+}
+
+TEST_CASE("lsxhome: a failed model run never mislabels the echoed prompt as Paris",
+          "[lsxhome][gui]") {
+    // A model was requested but produced nothing. The prompt must come back so
+    // the user sees it — tagged with the unknown-id 0, because id 11751 really
+    // does mean "Paris" and stamping it on arbitrary text is a lie.
+    const TokenPayload echoed = MakeFallbackTokenPayload("why is the sky blue", true);
+    REQUIRE(echoed.token_id == 0);
+    REQUIRE(std::strcmp(echoed.text, "why is the sky blue") == 0);
+    REQUIRE(echoed.ns_stamp > 0);
+}
+
+TEST_CASE("lsxhome: an invalidated back-buffer pool refuses every index",
+          "[lsxhome][renderer]") {
+    // Regression guard for the audited resize crash: ResizeBuffers failure left
+    // the back buffers reset, yet EndFrame still built a PRESENT->RENDER_TARGET
+    // barrier against a null resource. The frame path must be able to ask
+    // whether a back buffer exists before touching it.
+    SwapchainTargets targets;
+    targets.Install(3);
+    REQUIRE(targets.Ready(2));
+
+    targets.Invalidate();
+    REQUIRE(targets.Installed() == 0);
+    REQUIRE_FALSE(targets.Ready(0));
+    REQUIRE_FALSE(targets.Ready(1));
+    REQUIRE_FALSE(targets.Ready(2));
+}
+
+TEST_CASE("lsxhome: installed back buffers are exactly the reported range",
+          "[lsxhome][renderer]") {
+    SwapchainTargets fresh;
+    REQUIRE(fresh.Installed() == 0);
+    REQUIRE_FALSE(fresh.Ready(0));
+
+    SwapchainTargets targets;
+    targets.Install(3);
+    REQUIRE(targets.Installed() == 3);
+    REQUIRE(targets.Ready(0));
+    REQUIRE(targets.Ready(1));
+    REQUIRE(targets.Ready(2));
+    REQUIRE_FALSE(targets.Ready(3));
+    REQUIRE_FALSE(targets.Ready(-1));
+}
+
+TEST_CASE("lsxhome: a freed SRV descriptor slot returns to the pool",
+          "[lsxhome][renderer]") {
+    // Regression guard for the audited leak: the renderer's descriptor
+    // free-list used to drop the slot on Free, so the heap drained for the
+    // lifetime of the process. A freed slot must be allocatable again.
+    SrvDescriptorPool pool;
+    pool.Reset(2);
+
+    int a = -1;
+    int b = -1;
+    REQUIRE(pool.Alloc(a));
+    REQUIRE(pool.Alloc(b));
+    REQUIRE(pool.InUseCount() == 2);
+
+    int exhausted = -1;
+    REQUIRE_FALSE(pool.Alloc(exhausted));  // both slots are live
+
+    REQUIRE(pool.Free(a));
+    REQUIRE(pool.InUseCount() == 1);
+
+    int recycled = -1;
+    REQUIRE(pool.Alloc(recycled));         // the freed slot came back
+    REQUIRE(pool.InUseCount() == 2);
+    REQUIRE((recycled == a || recycled == b));
 }
 
 TEST_CASE("lsxhome: SPSC pool is pre-allocated and never allocates on publish",

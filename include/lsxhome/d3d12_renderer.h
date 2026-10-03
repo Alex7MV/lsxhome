@@ -3,6 +3,8 @@
 struct HWND__;
 typedef HWND__* HWND;
 
+#include "lsxhome/srv_descriptor_pool.h"
+
 namespace lsxhome {
 
 /// DirectX 12 hardware-accelerated renderer for the lsxhome desktop shell.
@@ -18,7 +20,7 @@ class D3D12Renderer {
 public:
     static constexpr int kBackBufferCount = 3;    // FLIP_DISCARD requires >= 2
     static constexpr int kFramesInFlight  = 3;    // CPU/GPU overlap depth
-    static constexpr int kSrvPoolDescriptors = 256;
+    static constexpr int kSrvPoolDescriptors = SrvDescriptorPool::kMaxDescriptors;
 
     D3D12Renderer() noexcept = default;
     ~D3D12Renderer() noexcept { Shutdown(); }
