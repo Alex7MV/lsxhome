@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "lsxhome/chat_state.h"
 #include "lsxhome/text_splitter.h"
 
 #include <atomic>
@@ -117,4 +118,98 @@ TEST_CASE("lsxhome: chunking below one codepoint widens instead of corrupting",
     REQUIRE(n == 1);
     REQUIRE(chunks[0].size() == 4);
     REQUIRE(IsValidUtf8(chunks[0]));
+}
+
+TEST_CASE("lsxhome: a turn appends the question and opens an assistant reply",
+          "[lsxhome][chat]") {
+    lsxhome::ChatState state;
+    REQUIRE(state.empty());
+    REQUIRE_FALSE(state.Busy());
+
+    REQUIRE(state.BeginTurn("why is the sky blue"));
+    REQUIRE(state.Busy());
+    REQUIRE(state.messages().size() == 2);
+    REQUIRE(state.messages()[0].role == "user");
+    REQUIRE(state.messages()[0].text == "why is the sky blue");
+    REQUIRE(state.messages()[1].role == "assistant");
+    REQUIRE(state.messages()[1].text.empty());
+    REQUIRE_FALSE(state.messages()[1].interrupted);
+
+    state.EndTurn(false);
+    REQUIRE_FALSE(state.Busy());
+}
+
+TEST_CASE("lsxhome: a turn is refused while empty or already open",
+          "[lsxhome][chat]") {
+    lsxhome::ChatState state;
+    REQUIRE_FALSE(state.BeginTurn(""));       // nothing to ask
+    REQUIRE(state.empty());
+
+    REQUIRE(state.BeginTurn("first"));
+    REQUIRE_FALSE(state.BeginTurn("second"));  // a reply is still streaming
+    REQUIRE(state.messages().size() == 2);
+
+    state.EndTurn(false);
+    REQUIRE(state.BeginTurn("second"));        // the previous turn is closed
+    REQUIRE(state.messages().size() == 4);
+    REQUIRE(state.messages()[2].text == "second");
+}
+
+TEST_CASE("lsxhome: streamed deltas append in order and ignore stale chunks",
+          "[lsxhome][chat]") {
+    lsxhome::ChatState state;
+    REQUIRE(state.BeginTurn("question"));
+
+    REQUIRE(state.AppendDelta(0, kHello));
+    REQUIRE(state.AppendDelta(1, ", "));
+    REQUIRE(state.AppendDelta(2, kWorld));
+
+    // A replayed or out-of-order chunk must never corrupt the reply text.
+    REQUIRE_FALSE(state.AppendDelta(2, "!"));
+    REQUIRE_FALSE(state.AppendDelta(0, "?"));
+    REQUIRE_FALSE(state.AppendDelta(1, "?"));
+    REQUIRE_FALSE(state.AppendDelta(99, "?"));
+    REQUIRE(state.messages()[1].text == std::string(kHello) + ", " + kWorld);
+
+    // An empty delta is not a chunk.
+    REQUIRE_FALSE(state.AppendDelta(3, ""));
+
+    // The seq cursor resets with the turn.
+    state.EndTurn(true);
+    REQUIRE(state.messages()[1].interrupted);
+    REQUIRE(state.BeginTurn("next"));
+    REQUIRE(state.AppendDelta(0, "fresh"));
+    REQUIRE(state.messages().back().text == "fresh");
+}
+
+TEST_CASE("lsxhome: deltas are refused once the reply is closed", "[lsxhome][chat]") {
+    lsxhome::ChatState state;
+    REQUIRE(state.BeginTurn("question"));
+    REQUIRE(state.AppendDelta(0, "text"));
+    state.EndTurn(false);
+
+    REQUIRE_FALSE(state.AppendDelta(1, "tail"));
+    REQUIRE(state.messages()[1].text == "text");
+    REQUIRE(state.messages().size() == 2);
+}
+
+TEST_CASE("lsxhome: the error line is set and cleared independently", "[lsxhome][chat]") {
+    lsxhome::ChatState state;
+    REQUIRE(state.error().empty());
+
+    state.SetError("model path is required: --model <path>");
+    REQUIRE(state.error() == "model path is required: --model <path>");
+
+    state.ClearError();
+    REQUIRE(state.error().empty());
+
+    state.BeginTurn("question");
+    state.AppendDelta(0, "text");
+    state.EndTurn(false);
+    state.SetError("failure");
+    state.Clear();
+    REQUIRE(state.empty());
+    REQUIRE(state.error().empty());
+    REQUIRE_FALSE(state.Busy());
+    REQUIRE(state.BeginTurn("after clear"));
 }
