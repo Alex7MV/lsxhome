@@ -90,9 +90,11 @@ public:
         }
 
         // Per-token detokenization with UTF-8 boundary safety: every delta is
-        // valid text, never half a codepoint.
-        auto detokenizer = lsxcommon::IncrementalDetokenizer::ArrowDecoder(
-            model_->Tokenizer());
+        // valid text, never half a codepoint. ArrowDecoder supplies the real
+        // vocabulary-backed decode; IncrementalDetokenizer owns the boundary
+        // logic and emits only newly completed text.
+        lsxcommon::IncrementalDetokenizer detokenizer(
+            lsxcommon::IncrementalDetokenizer::ArrowDecoder(model_->Tokenizer()));
 
         lsxcommon::ModelRequest request{std::move(input_ids), kMaxGenTokens};
         request.abort_flag = &abort;
