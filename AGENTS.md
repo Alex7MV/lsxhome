@@ -66,8 +66,13 @@ Tests are Windows-only (they link `lsxcommon`), label `fast`:
   `GenerationBackend` — submission, single `Prepare` across turns, multi-turn
   history framing, mid-stream refusal, full-queue and oversized refusals, Stop
   through the abort flag, `Prepare`/`Infer` failure phases, destructor join; and
-  the allocation-free drain of 1024 streamed chunks. The file is ASCII-only:
-  non-ASCII literals would be decoded through the compiler's source codepage.
+  the allocation-free drain of 1024 streamed chunks; `ResolveModelRoot` accepts
+  either the model root or the converted directory; `NormalizeEngineText`
+  reverses the byte-level BPE escapes (against a recomputed GPT-2
+  `bytes_to_unicode` reference for all 256 bytes) and drops bytes that cannot
+  form UTF-8. The file is ASCII-only: non-ASCII literals would be decoded
+  through the compiler's source codepage, and `\xNN` escapes are greedy, so
+  multibyte strings are built from explicit bytes.
 - `patch_drift_guard` — the after-fetch patch helper rewrites a live key,
   refuses a drifted key, and never re-wraps or skips a self-nested key.
 
@@ -83,8 +88,8 @@ alloc/free contract is verifiable without a GPU.
   panel), `lsx_generation_backend.cpp` (the only TU that includes `lsxcommon`).
 - `include/lsxhome/` — `d3d12_renderer.h`, `font_loader.h`, `gui_bridge.h`,
   `spsc_token_ring.h`, `srv_descriptor_pool.h`, `swapchain_targets.h`,
-  `text_splitter.h`, `blackwell_theme.h`, `gui_renderer.h`,
-  `imnodes_offsetof_shim.h`, `chat_state.h`, `chat_session.h`,
+  `text_splitter.h`, `text_normalizer.h`, `model_root.h`, `blackwell_theme.h`,
+  `gui_renderer.h`, `imnodes_offsetof_shim.h`, `chat_state.h`, `chat_session.h`,
   `generation_backend.h`, `lsx_generation_backend.h`.
 - `cmake/` — `embed_binary.cmake` + `embed_font.ps1` (TTF → byte-array TU),
   `patch_vendored_sources.cmake` (after-fetch rewrite helper),
@@ -167,6 +172,16 @@ alloc/free contract is verifiable without a GPU.
 - `ChatSession::Busy()` (queued or running turns) is the UI's "a turn is in
   flight" gate; `phase() == kIdle` is not, because a freshly queued question has
   not reached the worker yet.
+- **Engine text must go through `NormalizeEngineText` before it reaches
+  `BuildConversationInputIds`.** `arrow_tokenizer_decode` returns raw vocabulary
+  bytes, so a Gemma answer arrives with byte-level BPE escapes (the space is
+  U+0120 «Ġ», a newline U+010A) and sometimes with a lone high byte. Framed back
+  into the next turn, that text is rejected outright — the vocabulary sees one
+  500+ byte "word" (`kMaxWordBytes` is 512) or malformed UTF-8 — so the first
+  question worked and every follow-up one failed. The normalizer reverses the
+  GPT-2 `bytes_to_unicode` mapping and drops bytes that cannot form UTF-8; it
+  runs on every streamed delta and on every history message, so the transcript,
+  the prompt and the screen all agree.
 
 ## Subagent policy
 

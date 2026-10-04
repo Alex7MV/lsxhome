@@ -28,6 +28,35 @@ namespace lsxhome {
 ///
 /// Everything else — tabs, newlines, punctuation, letters, emoji — passes
 /// through byte-identical.
+/// Rewrites engine output into text the tokenizer can encode back, using the
+/// three transformations that are provably safe, and nothing else.
+///
+/// What the engine actually produces (measured on the Gemma-4 checkpoint):
+///
+///  1. **Byte-level BPE escapes.** The vocabulary stores non-printable bytes as
+///     Latin-1 supplement glyphs — 0x20 as U+0120 «Ġ», 0x09 as U+0109, 0x0A as
+///     U+010A (GPT-2 `bytes_to_unicode`) — and the decoder returns those glyphs.
+///     So a generated answer contains no ordinary space. Un-reversed, the whole
+///     answer is one 500+ byte "word" to the vocabulary (`kMaxWordBytes` is 512)
+///     and the next prompt is rejected outright.
+///  2. **C1 controls.** The model also emits byte-fallback pieces
+///     (`<0xC2><0x97>`) that decode to U+0097, repeated dozens of times per
+///     answer. Valid UTF-8, invisible, and the reason the model itself reports
+///     that the conversation "looks like the wrong encoding".
+///  3. **Unicode spaces** (U+00A0, thin/narrow no-break, ideographic) that this
+///     vocabulary has no token for.
+///
+/// Deliberately NOT done — each was tried and rejected during the audit:
+///
+///  - **No re-encoding of Latin-1 to bytes.** A printable byte keeps its
+///    character in the vocabulary, so "é" (U+00E9) and a vocabulary byte 0xE9
+///    are the same two bytes; only the tokenizer can tell them apart, and
+///    guessing destroys real text.
+///  - **No re-encoding from the Windows ANSI code page.** Text arriving from the
+///    engine and from the input box is already UTF-8 (verified byte-exactly);
+///    converting by `GetACP()` would double-decode it.
+///  - **No collapsing or rewriting of word content.** Only the characters above
+///    are touched, so words, punctuation, newlines and tabs survive unchanged.
 inline std::string NormalizeEngineText(std::string_view text) {
     std::string out;
     out.reserve(text.size());
@@ -139,7 +168,26 @@ inline std::string NormalizeEngineText(std::string_view text) {
             ++j;
             continue;
         }
-        valid.append(out, j, len);
+        // U+0080..U+009F: C1 controls. The model emits them between words
+        // (U+0097 in the observed answer). They are valid UTF-8, so the
+        // structural check keeps them, but they are invisible junk — and the
+        // model reads its own transcript back as "wrong encoding" because of
+        // them. Dropped.
+        const bool is_c1_control =
+            len == 2u && out[j] == static_cast<char>(0xC2u) &&
+            static_cast<unsigned char>(out[j + 1]) >= 0x80u &&
+            static_cast<unsigned char>(out[j + 1]) <= 0x9Fu;
+        if (is_c1_control) {
+            j += len;
+            continue;
+        }
+        if (len == 1u && lead < 0x20u && out[j] != '\n' && out[j] != '\t') {
+            valid += ' ';  // invisible C0 control
+        } else if (len == 1u && lead == 0x7Fu) {
+            valid += ' ';  // DEL
+        } else {
+            valid.append(out, j, len);
+        }
         j += len;
     }
     return valid;

@@ -22,6 +22,7 @@
 #include "lsxcommon/model_engine.h"
 #include "lsxcommon/model_factory.h"
 
+#include <absl/strings/escaping.h>
 #include <absl/strings/str_cat.h>
 
 namespace lsxhome {
@@ -108,6 +109,7 @@ public:
             "[engine] generate: history=", history.size(),
             " input_ids=", input_ids.size()));
 
+
         // Per-token detokenization with UTF-8 boundary safety: every delta is
         // valid text, never half a codepoint. ArrowDecoder supplies the real
         // vocabulary-backed decode; IncrementalDetokenizer owns the boundary
@@ -154,6 +156,7 @@ public:
             out_error = "the model returned an empty answer";
             return GenerationStatus::kError;
         }
+
         return GenerationStatus::kOk;
     }
 

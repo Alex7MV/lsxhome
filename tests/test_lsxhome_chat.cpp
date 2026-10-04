@@ -676,6 +676,45 @@ TEST_CASE("lsxhome: byte-level markers decode back to their bytes",
                 Utf8Encode(ReferenceMarkerCp(0x01u))) == " ");
 }
 
+TEST_CASE("lsxhome: C1 control characters never reach the transcript", "[lsxhome][chat]") {
+    // The model emits U+0097 (a C1 control) between words. It is valid UTF-8,
+    // so a structural validator keeps it — but it is invisible junk, and the
+    // model itself flags the text as "wrong encoding" when it reads its own
+    // transcript back. Dropped here.
+    const std::string c1 = {static_cast<char>(0xC2), static_cast<char>(0x97)};
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + c1 + kWorld) == kHello + kWorld);
+    // DEL is invisible junk too; it becomes a space rather than vanishing, so
+    // it never splits two words together.
+    REQUIRE(lsxhome::NormalizeEngineText(std::string(1, '\x7F')) == " ");
+
+    // A C1 control next to ordinary text is removed without touching the text.
+    REQUIRE(lsxhome::NormalizeEngineText("ok" + c1 + " done") == "ok done");
+    REQUIRE(IsValidUtf8(lsxhome::NormalizeEngineText("ok" + c1 + " done")));
+
+    // Real typography must survive: U+2019 (') is not a control.
+    const std::string apostrophe = "\xE2\x80\x99";
+    REQUIRE(lsxhome::NormalizeEngineText(kWorld + apostrophe) ==
+            kWorld + apostrophe);
+}
+
+TEST_CASE("lsxhome: latin-1 characters are left to the vocabulary", "[lsxhome][chat]") {
+    // A printable Latin-1 byte keeps its character in a byte-level vocabulary,
+    // so "é" is ordinary text that round-trips through the tokenizer unchanged.
+    // Deciding otherwise would be guessing: U+00E9 as text and byte 0xE9 as a
+    // vocabulary piece are the same bytes, and only the converted model's
+    // tokenizer can tell them apart.
+    const std::string e_acute = "\xC3\xA9";
+    REQUIRE(IsValidUtf8(e_acute));
+    REQUIRE(lsxhome::NormalizeEngineText(e_acute) == e_acute);
+    REQUIRE(lsxhome::NormalizeEngineText("Caf" + e_acute + "!") ==
+            "Caf" + e_acute + "!");
+
+    // A marker pair is NOT text: those bytes start no valid sequence on their
+    // own, so they are restored (or dropped) instead of being shown.
+    REQUIRE(lsxhome::NormalizeEngineText(
+                Utf8Encode(ReferenceMarkerCp(0x20u)) + e_acute) == " " + e_acute);
+}
+
 TEST_CASE("lsxhome: stray bytes that cannot form UTF-8 are dropped", "[lsxhome][chat]") {
     // The engine's decoder hands back raw vocabulary bytes, so an answer can
     // contain a lone high byte that starts no UTF-8 sequence. Framing that back
