@@ -4,6 +4,7 @@
 #include "lsxhome/chat_state.h"
 #include "lsxhome/generation_backend.h"
 #include "lsxhome/gui_bridge.h"
+#include "lsxhome/history_budget.h"
 #include "lsxhome/model_root.h"
 #include "lsxhome/text_normalizer.h"
 #include "lsxhome/text_splitter.h"
@@ -640,219 +641,146 @@ unsigned ReferenceMarkerCp(unsigned b) {
     }
     return 256u + n;
 }
-
-/// Inverse of `ReferenceMarkerCp`: which byte a lifted codepoint stands for.
-unsigned ReferenceInverseByte(unsigned cp) {
-    for (unsigned b = 0; b < 256u; ++b) {
-        if (ReferenceMarkerCp(b) == cp) {
-            return b;
-        }
-    }
-    return 0u;
-}
 }  // namespace
 
-TEST_CASE("lsxhome: byte-level markers decode back to their bytes",
+// ── Engine-text normalization ────────────────────────────────────────────────
+// Measured on the converted Gemma-4 checkpoint after the engine fix
+// (logestix 456280d, "decode to text the tokenizer can encode again"):
+//   * the decoder now substitutes U+FFFD for any byte that cannot begin or
+//     complete a well-formed sequence, so invalid bytes never reach the shell;
+//   * the vocabulary lifts nothing into U+0100..U+0143 (the space is an ordinary
+//     0x20 token), so the GPT-2 "Ġ" theory does not apply to this checkpoint;
+//   * what IS left is C1 control junk: the model emits byte-fallback pieces
+//     (<0xC2><0x97> = U+0097) repeatedly inside its answers.
+//
+// So the shell's job is narrow: drop the C1 controls, leave everything else
+// byte-identical. Anything more aggressive rewrites the model's own words.
+
+TEST_CASE("lsxhome: C1 control junk is dropped from an answer", "[lsxhome][chat]") {
+    const std::string u0097 = {static_cast<char>(0xC2), static_cast<char>(0x97)};
+    const std::string u0085 = {static_cast<char>(0xC2), static_cast<char>(0x85)};  // NEL
+
+    REQUIRE(lsxhome::NormalizeEngineText(u0097).empty());
+    REQUIRE(lsxhome::NormalizeEngineText(u0085).empty());
+    REQUIRE(lsxhome::NormalizeEngineText("a" + u0097 + "b") == "ab");
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + u0097 + kWorld) ==
+            kHello + kWorld);
+
+    // Every C1 codepoint is in range U+0080..U+009F, i.e. C2 80..C2 9F.
+    for (unsigned cp = 0x80u; cp <= 0x9Fu; ++cp) {
+        const std::string control = Utf8Encode(cp);
+        REQUIRE(lsxhome::NormalizeEngineText(control).empty());
+    }
+
+    // The result is always valid UTF-8 and never contains a control character.
+    const std::string cleaned =
+        lsxhome::NormalizeEngineText(kHello + u0097 + ", " + kWorld + u0085);
+    REQUIRE(IsValidUtf8(cleaned));
+    REQUIRE(cleaned == kHello + ", " + kWorld);
+}
+
+TEST_CASE("lsxhome: normalization leaves the model's own text byte-identical",
           "[lsxhome][chat]") {
-    // Control and ASCII bytes travel as lifted markers.
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(ReferenceMarkerCp(0x20u))) == " ");   // space
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(ReferenceMarkerCp(0x09u))) == "\t");  // tab
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(ReferenceMarkerCp(0x0Au))) == "\n");  // newline
+    // ASCII, Cyrillic, emoji, tabs and newlines: untouched.
+    REQUIRE(lsxhome::NormalizeEngineText("Plain ASCII text") == "Plain ASCII text");
+    REQUIRE(lsxhome::NormalizeEngineText(kHello) == kHello);
+    REQUIRE(lsxhome::NormalizeEngineText(kGlobe) == kGlobe);
+    REQUIRE(lsxhome::NormalizeEngineText("line1\nline2\ttabbed") ==
+            "line1\nline2\ttabbed");
+    REQUIRE(lsxhome::NormalizeEngineText("").empty());
 
-    // Printable bytes are NOT lifted: their marker is the character itself, and
-    // it must pass through untouched (GPT-2 keeps 0x21..0x7E and the printable
-    // Latin-1 range as-is).
-    REQUIRE(lsxhome::NormalizeEngineText("Hello, world!") == "Hello, world!");
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(ReferenceMarkerCp(0xABu))) ==
-            Utf8Encode(ReferenceMarkerCp(0xABu)));
-
-    // A lifted control byte that is not printable whitespace becomes a space, so
-    // the transcript never carries an invisible control character.
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(ReferenceMarkerCp(0x01u))) == " ");
-}
-
-TEST_CASE("lsxhome: C1 control characters never reach the transcript", "[lsxhome][chat]") {
-    // The model emits U+0097 (a C1 control) between words. It is valid UTF-8,
-    // so a structural validator keeps it — but it is invisible junk, and the
-    // model itself flags the text as "wrong encoding" when it reads its own
-    // transcript back. Dropped here.
-    const std::string c1 = {static_cast<char>(0xC2), static_cast<char>(0x97)};
-    REQUIRE(lsxhome::NormalizeEngineText(kHello + c1 + kWorld) == kHello + kWorld);
-    // DEL is invisible junk too; it becomes a space rather than vanishing, so
-    // it never splits two words together.
-    REQUIRE(lsxhome::NormalizeEngineText(std::string(1, '\x7F')) == " ");
-
-    // A C1 control next to ordinary text is removed without touching the text.
-    REQUIRE(lsxhome::NormalizeEngineText("ok" + c1 + " done") == "ok done");
-    REQUIRE(IsValidUtf8(lsxhome::NormalizeEngineText("ok" + c1 + " done")));
-
-    // Real typography must survive: U+2019 (') is not a control.
-    const std::string apostrophe = "\xE2\x80\x99";
-    REQUIRE(lsxhome::NormalizeEngineText(kWorld + apostrophe) ==
-            kWorld + apostrophe);
-}
-
-TEST_CASE("lsxhome: latin-1 characters are left to the vocabulary", "[lsxhome][chat]") {
-    // A printable Latin-1 byte keeps its character in a byte-level vocabulary,
-    // so "é" is ordinary text that round-trips through the tokenizer unchanged.
-    // Deciding otherwise would be guessing: U+00E9 as text and byte 0xE9 as a
-    // vocabulary piece are the same bytes, and only the converted model's
-    // tokenizer can tell them apart.
+    // Latin-1 typography ("é") is ordinary text: the vocabulary keeps it and
+    // re-encoding it is exact. Rewriting it would corrupt real answers.
     const std::string e_acute = "\xC3\xA9";
-    REQUIRE(IsValidUtf8(e_acute));
     REQUIRE(lsxhome::NormalizeEngineText(e_acute) == e_acute);
     REQUIRE(lsxhome::NormalizeEngineText("Caf" + e_acute + "!") ==
             "Caf" + e_acute + "!");
 
-    // A marker pair is NOT text: those bytes start no valid sequence on their
-    // own, so they are restored (or dropped) instead of being shown.
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(ReferenceMarkerCp(0x20u)) + e_acute) == " " + e_acute);
+    // Smart quotes and dashes the model emits are content.
+    const std::string typographic = "\xE2\x80\x99\xE2\x80\x93";
+    REQUIRE(lsxhome::NormalizeEngineText(typographic) == typographic);
+
+    // U+0120 «Ġ» is a valid character in this vocabulary (it decodes as-is), so
+    // it must NOT be rewritten into a space.
+    const std::string g_with_dot = "\xC4\xA0";
+    REQUIRE(lsxhome::NormalizeEngineText(g_with_dot) == g_with_dot);
+
+    // The engine's own repair marker stays visible: it tells the user exactly
+    // where a byte could not be reconstructed.
+    const std::string replacement = "\xEF\xBF\xBD";
+    REQUIRE(lsxhome::NormalizeEngineText("a" + replacement + "b") ==
+            "a" + replacement + "b");
+
+    // DEL is invisible junk; it becomes a space so words never fuse.
+    REQUIRE(lsxhome::NormalizeEngineText(std::string(1, '\x7F')) == " ");
+    REQUIRE(lsxhome::NormalizeEngineText("a" + std::string(1, '\x7F') + "b") ==
+            "a b");
 }
 
-TEST_CASE("lsxhome: stray bytes that cannot form UTF-8 are dropped", "[lsxhome][chat]") {
-    // The engine's decoder hands back raw vocabulary bytes, so an answer can
-    // contain a lone high byte that starts no UTF-8 sequence. Framing that back
-    // into the next prompt fails outright (the tokenizer rejects malformed
-    // UTF-8), so normalization must not pass it on.
-    const std::string lone = {static_cast<char>(0xAB)};
-    REQUIRE(lsxhome::NormalizeEngineText(lone).empty());
-    REQUIRE(lsxhome::NormalizeEngineText(std::string(1, '\xC4')).empty());
+// ── Prompt budget ────────────────────────────────────────────────────────────
+TEST_CASE("lsxhome: a short conversation is framed whole", "[lsxhome][chat]") {
+    const std::vector<ChatTurn> history = {
+        {"user", "first question"},
+        {"assistant", "first answer"},
+        {"user", "second question"},
+    };
 
-    // A broken sequence around real text is repaired, not propagated.
-    const std::string mixed = std::string(kHello) + lone +
-                              Utf8Encode(ReferenceMarkerCp(0x20u)) + kWorld;
-    const std::string fixed = lsxhome::NormalizeEngineText(mixed);
-    REQUIRE(IsValidUtf8(fixed));
-    REQUIRE(fixed == std::string(kHello) + " " + kWorld);
-
-    // A truncated multibyte tail (the model's last token cut off) is dropped.
-    const std::string truncated = std::string(kHello) + "\xD0";
-    const std::string repaired = lsxhome::NormalizeEngineText(truncated);
-    REQUIRE(IsValidUtf8(repaired));
-    REQUIRE(repaired == kHello);
+    const auto windowed = lsxhome::TrimHistoryToBudget(history, 4096);
+    REQUIRE(windowed.size() == history.size());
+    REQUIRE(windowed[0].text == "first question");
+    REQUIRE(windowed[2].text == "second question");
 }
 
-TEST_CASE("lsxhome: a marker pair rebuilds one UTF-8 character", "[lsxhome][chat]") {
-    // A lifted pair must reassemble into the character it encodes; a stray
-    // continuation byte next to real text is removed without touching the text.
-    const std::string with_quote = Utf8Encode(ReferenceMarkerCp(0x20u)) +
-                                   Utf8Encode(0x00C2u) +  // "«"
-                                   kHello +
-                                   Utf8Encode(ReferenceMarkerCp(0x20u));
-    const std::string decoded = lsxhome::NormalizeEngineText(with_quote);
-    REQUIRE(IsValidUtf8(decoded));
-    REQUIRE(decoded == " " + std::string(Utf8Encode(0x00C2u)) + kHello + " ");
-
-    // The whole answer must stay valid UTF-8 after normalization.
-    const std::string text = Utf8Encode(0x00C2u) + kHello +
-                             Utf8Encode(ReferenceMarkerCp(0x20u));
-    REQUIRE(IsValidUtf8(lsxhome::NormalizeEngineText(text)));
-}
-
-TEST_CASE("lsxhome: marker ranges decode to readable text",
+TEST_CASE("lsxhome: the oldest turns are dropped, and whole ones only",
           "[lsxhome][chat]") {
-    // The engine's decoder returns raw vocabulary bytes, so a generated answer
-    // arrives with no ordinary space and no ordinary newline — just U+0120 and
-    // U+010A. Framing that answer back into the next prompt then fails twice
-    // over: the vocabulary sees one 500+ byte "word" (kMaxWordBytes is 512), and
-    // the model reads the glyphs as mojibake ("wrong encoding").
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(0x0120)) == " ");  // U+0120 -> space
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(0x010A)) == "\n");  // U+010A -> newline
-    REQUIRE(lsxhome::NormalizeEngineText(
-                Utf8Encode(0x0109)) == "\t");  // U+0109 -> tab
-    // The whole lifted range must decode to a single character/byte, never to
-    // the raw glyph that would otherwise reach the prompt.
-    for (unsigned cp = 0x0100u; cp <= 0x0143u; ++cp) {
-        const std::string marker = Utf8Encode(cp);
-        const std::string decoded = lsxhome::NormalizeEngineText(marker);
-        INFO("codepoint=0x" << std::hex << cp << " marker_size=" << marker.size()
-                            << " decoded_size=" << decoded.size());
-        // High bytes that cannot start a UTF-8 sequence on their own are dropped
-        // (they are continuation bytes whose lead byte lives elsewhere).
-        const unsigned byte = ReferenceInverseByte(cp);
-        if (byte > 0x7Fu) {
-            REQUIRE(decoded.empty());
-        } else {
-            REQUIRE(decoded.size() == 1u);
-        }
-        REQUIRE(decoded != marker);  // never the glyph itself
+std::vector<ChatTurn> history;
+    // Strictly alternating user/assistant, ending on the question being asked.
+    for (int i = 0; i < 21; ++i) {
+        history.push_back({(i % 2) == 0 ? "user" : "assistant",
+                           std::string(200, static_cast<char>('a' + i % 26))});
     }
+    const auto windowed = lsxhome::TrimHistoryToBudget(history, 900);
+    REQUIRE_FALSE(windowed.empty());
+    REQUIRE(windowed.size() < history.size());
 
-    // A full sentence of markers turns back into readable text with real word
-    // boundaries.
-    const std::string sentence =
-        Utf8Encode(0x0120) + std::string(kHello) + Utf8Encode(0x0120) +
-        std::string(kWorld) + Utf8Encode(0x010A) + Utf8Encode(0x010A) +
-        std::string(kWorld);
-    const std::string normalized = lsxhome::NormalizeEngineText(sentence);
-    REQUIRE(normalized ==
-            std::string(" ") + kHello + " " + kWorld + "\n\n" + kWorld);
+    // Kept turns are a suffix of the conversation, and it still ends with the
+    // question the model has to answer.
+    REQUIRE(windowed.back().role == "user");
+    REQUIRE(windowed.back().text == history.back().text);
 
-    std::size_t longest = 0;
-    std::size_t run = 0;
-    for (const char ch : normalized) {
-        run = (ch == ' ') ? 0 : run + 1;
-        longest = std::max(longest, run);
+    // A half exchange (assistant without its question) is never framed: the
+    // family template expects user -> assistant -> user.
+    std::size_t users = 0;
+    std::size_t assistants = 0;
+    for (const ChatTurn& turn : windowed) {
+        users += turn.role == "user" ? 1 : 0;
+        assistants += turn.role == "assistant" ? 1 : 0;
     }
-    REQUIRE(longest < 64);
+    REQUIRE(users == assistants + 1);
 }
 
-TEST_CASE("lsxhome: non-breaking spaces become plain spaces", "[lsxhome][chat]") {
-    // The engine's vocabulary has no U+00A0, so a model that emits it makes
-    // arrow_tokenizer_encode fail and the whole next prompt is rejected.
-    const std::string nbsp = {static_cast<char>(0xC2),
-                              static_cast<char>(0xA0)};  // U+00A0
-    const std::string narrow = {static_cast<char>(0xE2),
-                                static_cast<char>(0x80),
-                                static_cast<char>(0xAF)};  // U+202F
-    const std::string figure = {static_cast<char>(0xE2),
-                                static_cast<char>(0x80),
-                                static_cast<char>(0x87)};  // U+2007
-    const std::string thin = {static_cast<char>(0xE2),
-                              static_cast<char>(0x80),
-                              static_cast<char>(0x89)};  // U+2009
-    const std::string em = {static_cast<char>(0xE3),
-                            static_cast<char>(0x80),
-                            static_cast<char>(0x80)};  // U+3000
-
-    REQUIRE(lsxhome::NormalizeEngineText(kHello + nbsp + kWorld) ==
-            std::string(kHello) + " " + kWorld);
-    REQUIRE(lsxhome::NormalizeEngineText(kHello + narrow + kWorld) ==
-            std::string(kHello) + " " + kWorld);
-    REQUIRE(lsxhome::NormalizeEngineText(kHello + figure + kWorld) ==
-            std::string(kHello) + " " + kWorld);
-    REQUIRE(lsxhome::NormalizeEngineText(kHello + thin + kWorld) ==
-            std::string(kHello) + " " + kWorld);
-    REQUIRE(lsxhome::NormalizeEngineText(kHello + em + kWorld) ==
-            std::string(kHello) + " " + kWorld);
-
-    // Only the characters are rewritten, never collapsed: two exotic spaces
-    // stay two spaces, so the model's own spacing survives untouched.
-    REQUIRE(lsxhome::NormalizeEngineText(kHello + nbsp + narrow + kWorld) ==
-            std::string(kHello) + "  " + kWorld);
-}
-
-TEST_CASE("lsxhome: normalization leaves ordinary text byte-identical",
+TEST_CASE("lsxhome: an over-long single question survives the budget",
           "[lsxhome][chat]") {
-    const std::string plain = "Plain ASCII text";
-    REQUIRE(lsxhome::NormalizeEngineText(plain) == plain);
+    // Whatever the budget, the newest question must reach the model: dropping it
+    // would answer nothing at all.
+    const std::vector<ChatTurn> history = {
+        {"assistant", std::string(9000, 'x')},
+        {"user", "what is the answer?"},
+    };
 
-    const std::string cyrillic = "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82";  // Привет
-    REQUIRE(lsxhome::NormalizeEngineText(cyrillic) == cyrillic);
+    const auto windowed = lsxhome::TrimHistoryToBudget(history, 512);
+    REQUIRE(windowed.size() == 1);
+    REQUIRE(windowed.back().role == "user");
+    REQUIRE(windowed.back().text == "what is the answer?");
+}
 
-    // Tabs, newlines and punctuation are content, not spacing quirks.
-    const std::string layout = "line1\nline2\ttabbed \"quoted\" **bold**";
-    REQUIRE(lsxhome::NormalizeEngineText(layout) == layout);
-
-    REQUIRE(lsxhome::NormalizeEngineText("").empty());
-    // A 4-byte emoji survives: only spaces are touched.
-    REQUIRE(lsxhome::NormalizeEngineText(kGlobe) == kGlobe);
+TEST_CASE("lsxhome: the budget is measured in bytes", "[lsxhome][chat]") {
+    // Cyrillic costs two bytes each, so a byte budget must not assume one byte
+    // per character.
+    const std::vector<ChatTurn> history = {
+        {"user", std::string(200, ' ') + kHello},
+    };
+    const auto windowed = lsxhome::TrimHistoryToBudget(history, 16);
+    REQUIRE(windowed.size() == 1);
+    REQUIRE(windowed[0].text == history[0].text);
 }

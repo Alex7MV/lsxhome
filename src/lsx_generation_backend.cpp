@@ -5,11 +5,13 @@
 // per-token detokenization, and cooperative abort. Everything upstream of this
 // file stays free of engine types, so the session logic is unit-testable.
 
+#include "lsxhome/history_budget.h"
 #include "lsxhome/lsx_generation_backend.h"
 #include "lsxhome/model_root.h"
 #include "lsxhome/text_normalizer.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -28,6 +30,13 @@ namespace lsxhome {
 namespace {
 
 constexpr int kMaxGenTokens = 512;
+
+/// Prompt budget for the framed history. Answer time grows with the prompt, and
+/// a transcript that never forgets made every question slower than the last
+/// (measured on the real checkpoint: input_ids 41 → 417 → 468 → 1733 across
+/// four turns of one conversation). ~4000 bytes of Cyrillic history is a few
+/// turns of context — enough to follow along, bounded enough to stay responsive.
+constexpr std::size_t kHistoryBudgetBytes = 4000;
 
 class LsxGenerationBackend final : public GenerationBackend {
 public:
@@ -82,8 +91,13 @@ public:
         // normalized first: a pasted question can carry the same exotic spaces
         // the model's own answers do, and those break the vocabulary encode.
         lsxcommon::ChatConversation conversation;
-        conversation.messages.reserve(history.size());
-        for (const ChatTurn& turn : history) {
+        // The transcript keeps every turn; the prompt does not. Trimming here —
+        // right before framing — keeps the rule in one place and leaves the
+        // on-screen history complete.
+        const std::vector<ChatTurn> windowed =
+            TrimHistoryToBudget(history, kHistoryBudgetBytes);
+        conversation.messages.reserve(windowed.size());
+        for (const ChatTurn& turn : windowed) {
             lsxcommon::ChatMessage message;
             message.role = turn.role;
             message.content = NormalizeEngineText(turn.text);
@@ -155,6 +169,10 @@ if (result.output_text.empty()) {
             out_error = "the model returned an empty answer";
             return GenerationStatus::kError;
         }
+        // TEMP diagnostic: stderr, so the answer is readable without the engine's
+        // buffered log.
+        std::fprintf(stderr, "[answer] %s\n", result.output_text.c_str());
+        std::fflush(stderr);
         return GenerationStatus::kOk;
     }
 
