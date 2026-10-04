@@ -338,6 +338,22 @@ target_link_libraries(lsxhome PRIVATE
 
 lsxhome_copy_third_party_notices(lsxhome)
 
+# Audit probe (docs/repro/engine-encoding-audit): inspects how the converted
+# vocabulary stores and decodes non-printable bytes. Not part of the shell and
+# not part of the test suite — it is a tool for the engine audit. Built only on
+# demand:  cmake --build --preset windows-debug --target tokenizer_audit
+add_executable(tokenizer_audit
+    docs/repro/engine-encoding-audit/tokenizer_audit.cpp
+)
+target_compile_definitions(tokenizer_audit PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(tokenizer_audit PRIVATE
+    lsxcommon
+    arrow_shared
+    absl::flat_hash_map
+    absl::span
+    absl::strings
+)
+
 # MPL-2.0 section 3.2(a): ship the statically linked libzmq Source Code Form
 # next to the Release binary. The script is a no-op for Debug/other configs.
 add_custom_command(TARGET lsxhome POST_BUILD
