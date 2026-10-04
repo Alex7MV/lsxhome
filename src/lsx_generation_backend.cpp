@@ -22,7 +22,6 @@
 #include "lsxcommon/model_engine.h"
 #include "lsxcommon/model_factory.h"
 
-#include <absl/strings/escaping.h>
 #include <absl/strings/str_cat.h>
 
 namespace lsxhome {
@@ -152,11 +151,10 @@ public:
                             : result.error_msg;
             return GenerationStatus::kError;
         }
-        if (result.output_text.empty()) {
+if (result.output_text.empty()) {
             out_error = "the model returned an empty answer";
             return GenerationStatus::kError;
         }
-
         return GenerationStatus::kOk;
     }
 
