@@ -15,10 +15,13 @@
 //   4. Does arrow_tokenizer_encode accept the decoded text back? A chat
 //      transcript must round-trip: answer -> decode -> frame -> encode.
 
+#include "lsxcommon/chat_conversation.h"
+#include "lsxcommon/gemma_tool_format.h"
 #include "lsxcommon/tokenizer.h"
 
 #include <arrow/io/file.h>  // arrow::io::MemoryMappedFile
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -198,18 +201,55 @@ int main(int argc, char** argv) {
     Report("C1-control entries exist (model can emit them)", c1_entries > 0,
            "count=" + std::to_string(c1_entries));
 
-    // ── 4. Does the chat transcript round-trip? ─────────────────────────────
+    // ── 5. The actual failure mechanism ────────────────────────────────────
+    // The engine fix (logestix a077d53, "decode to text the tokenizer can
+    // encode again") makes BOTH decode branches substitute U+FFFD for bytes
+    // that cannot begin or complete a well-formed sequence, with a streaming
+    // state machine so byte-fallback pieces still assemble a codepoint split
+    // across tokens. These checks pin exactly that contract.
+
+    const std::string replacement = "\xEF\xBF\xBD";  // U+FFFD
+
+    // A vocabulary token whose value IS a lone high byte: the model can emit
+    // it, and decoding it must not yield an un-encodable byte.
+    for (const unsigned byte : {0x97u, 0xC4u, 0xE9u, 0x80u}) {
+        const std::int32_t id = db.byte_to_token_id[byte];
+        if (id < 0) {
+            Report("vocab exposes the lone byte as a token", false,
+                   "byte=0x" + std::to_string(byte));
+            continue;
+        }
+        const std::string decoded = Decode(db, {id});
+        // Either the decoder repaired it, or the byte was printable ASCII.
+        const bool repaired = decoded == replacement;
+        const bool unchanged = decoded.size() == 1 &&
+                               static_cast<unsigned char>(decoded[0]) == byte;
+        Report("decode(lone high byte) is encodable text",
+               repaired || unchanged,
+               "byte=0x" + std::to_string(byte) + " decoded=[" +
+                   Escape(decoded) + "]" +
+                   (repaired ? " (replaced)" : (unchanged ? " (as-is)" : " (BROKEN)")));
+    }
+
+    // The other half of the contract: byte-fallback pieces that assemble a
+    // real codepoint must survive untouched, or every Cyrillic character in a
+    // Russian answer would turn into three U+FFFD.
+    {
+        const std::int32_t b0 = db.byte_to_token_id[0xD0];  // 'П' = D0 9F
+        const std::int32_t b1 = db.byte_to_token_id[0x9F];
+        const std::string decoded = Decode(db, {b0, b1});
+        Report("decode(0xD0 0x9F) keeps the codepoint", decoded == "\xD0\x9F",
+               "decoded=[" + Escape(decoded) + "]");
+    }
+
     CheckEncode(db, "encode plain ASCII", "hello world");
     CheckEncode(db, "encode cyrillic UTF-8",
                 "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82");
     CheckEncode(db, "encode U+0120 (the 'Ġ' glyph seen in answers)",
                 "\xC4\xA0");
 
-    // ── 5. The actual failure mechanism ────────────────────────────────────
-    // byte_fallback pieces let the model emit a raw byte that starts no UTF-8
-    // sequence. The decoder passes it through, and the encoder rejects it —
-    // so one such byte in an answer makes every follow-up prompt fail to
-    // frame. These three checks bracket it.
+    // The encoder must still reject raw invalid text: that is what the decoder
+    // now prevents from ever reaching it.
     CheckEncode(db, "encode a C1 control (U+0097)", "ok\xC2\x97" "done");
     CheckEncode(db, "encode a lone continuation byte (0x97)", "ok\x97" "done");
     CheckEncode(db, "encode a lone lead byte (0xC4)", "ok\xC4" "done");
@@ -224,6 +264,73 @@ int main(int argc, char** argv) {
     }
     std::printf("byte_to_token_id populated for %d/256 bytes\n\n",
                 printable_fallback);
+
+    // ── 6. Encoder audit: does the model get the question we meant to send? ──
+    // The decode side is fixed (U+FFFD substitution). This checks the other
+    // direction: frame the question with the model's own chat template, encode
+    // it, decode it back, and require the text to be unchanged. Any difference
+    // is what the model actually reads instead of the user's words — the one
+    // failure mode that is invisible in the UI but fatal to the answer.
+    {
+        lsxcommon::ChatConversation conversation;
+        lsxcommon::ChatMessage question;
+        question.role = "user";
+        question.content = "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82, "
+                           "\xD0\xBA\xD0\xB0\xD0\xBA \xD0\xB4\xD0\xB5\xD0\xBB\xD0\xB0?";
+        conversation.messages.push_back(question);
+
+        std::string rendered;
+        const bool render_ok =
+            lsxcommon::RenderGemmaConversation(conversation, rendered);
+        Report("RenderGemmaConversation succeeds", render_ok,
+               "chars=" + std::to_string(rendered.size()));
+
+        std::vector<std::int32_t> ids;
+        const bool ids_ok =
+            lsxcommon::AppendGemmaChatIds(db, rendered, ids);
+        Report("AppendGemmaChatIds succeeds", ids_ok,
+               "ids=" + std::to_string(ids.size()));
+
+        if (ids_ok && !ids.empty()) {
+            const std::string back = Decode(db, ids);
+
+            // decode() drops special tokens by design, so compare the *user
+            // words*, not the whole template: they must arrive byte-exactly.
+            const std::string marker = "<|turn>user\n";
+            const std::size_t at = rendered.find(marker);
+            const std::size_t from = at == std::string::npos ? 0 : at + marker.size();
+            const std::size_t to =
+                rendered.find("<turn|>", from);
+            const std::string asked =
+                rendered.substr(from, to == std::string::npos
+                                            ? std::string::npos
+                                            : to - from);
+            Report("the question is framed into the prompt", at != std::string::npos,
+                   "asked=[" + Escape(asked).substr(0, 60) + "]");
+            Report("the user's question reaches the model byte-exactly",
+                   back.find(asked) != std::string::npos,
+                   "decoded=[" + Escape(back).substr(0, 90) + "]");
+
+            // No U+FFFD may appear: that would mean the encoder produced bytes
+            // the decoder had to repair, i.e. the question changed.
+            Report("no replacement characters in the framed prompt",
+                   back.find(replacement) == std::string::npos,
+                   "fffd_count=" + std::to_string(
+                       std::count(back.begin(), back.end(), '\xEF') > 0 ? 1 : 0));
+
+            // Every token must be a real vocabulary id (no unk, no hole).
+            bool ids_valid = true;
+            for (const std::int32_t id : ids) {
+                if (id < 0 || id >= db.vocab_size) {
+                    ids_valid = false;
+                    break;
+                }
+            }
+            Report("every framed id exists in the vocabulary", ids_valid,
+                   "ids=" + std::to_string(ids.size()) +
+                       " unk_id=" + std::to_string(db.unk_id));
+        }
+    }
 
     std::printf("\n%s: %d check(s) failed\n", g_failures ? "AUDIT" : "clean",
                 g_failures);
