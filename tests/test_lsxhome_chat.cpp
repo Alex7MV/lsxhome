@@ -604,10 +604,8 @@ TEST_CASE("lsxhome: an unrecognised model path is passed through untouched",
 
 // ── Engine-text normalization ──────────────────────────────────────────────
 namespace {
-/// Byte-level BPE escapes a vocabulary entry as a Latin-1 supplement glyph:
-/// the byte 0x20 becomes U+0120, 0x09 U+0109, 0x0A U+010A. Built as raw bytes
-/// because `\xNN` escapes are greedy and would swallow the next character.
-std::string ByteLevelMarker(unsigned cp) {
+/// UTF-8 encoding of @p cp, built from bytes (`\xNN` escapes are greedy).
+std::string Utf8Encode(unsigned cp) {
     std::string out;
     if (cp < 0x80u) {
         out += static_cast<char>(cp);
@@ -621,9 +619,104 @@ std::string ByteLevelMarker(unsigned cp) {
     }
     return out;
 }
+
+/// The reference GPT-2 `bytes_to_unicode` mapping, byte -> codepoint. Printable
+/// ASCII and Latin-1 keep their value; every other byte is lifted into the
+/// Latin-1 supplement in ascending byte order. Recomputed here (rather than
+/// mirrored from the implementation) so the test pins the algorithm, not the
+/// code.
+unsigned ReferenceMarkerCp(unsigned b) {
+    const auto printable = [](unsigned x) {
+        return (x >= 33u && x <= 126u) || (x >= 161u && x <= 172u) || x >= 174u;
+    };
+    if (printable(b)) {
+        return b;
+    }
+    unsigned n = 0;
+    for (unsigned x = 0; x < b; ++x) {
+        if (!printable(x)) {
+            ++n;
+        }
+    }
+    return 256u + n;
+}
+
+/// Inverse of `ReferenceMarkerCp`: which byte a lifted codepoint stands for.
+unsigned ReferenceInverseByte(unsigned cp) {
+    for (unsigned b = 0; b < 256u; ++b) {
+        if (ReferenceMarkerCp(b) == cp) {
+            return b;
+        }
+    }
+    return 0u;
+}
 }  // namespace
 
-TEST_CASE("lsxhome: byte-level BPE markers decode back to their bytes",
+TEST_CASE("lsxhome: byte-level markers decode back to their bytes",
+          "[lsxhome][chat]") {
+    // Control and ASCII bytes travel as lifted markers.
+    REQUIRE(lsxhome::NormalizeEngineText(
+                Utf8Encode(ReferenceMarkerCp(0x20u))) == " ");   // space
+    REQUIRE(lsxhome::NormalizeEngineText(
+                Utf8Encode(ReferenceMarkerCp(0x09u))) == "\t");  // tab
+    REQUIRE(lsxhome::NormalizeEngineText(
+                Utf8Encode(ReferenceMarkerCp(0x0Au))) == "\n");  // newline
+
+    // Printable bytes are NOT lifted: their marker is the character itself, and
+    // it must pass through untouched (GPT-2 keeps 0x21..0x7E and the printable
+    // Latin-1 range as-is).
+    REQUIRE(lsxhome::NormalizeEngineText("Hello, world!") == "Hello, world!");
+    REQUIRE(lsxhome::NormalizeEngineText(
+                Utf8Encode(ReferenceMarkerCp(0xABu))) ==
+            Utf8Encode(ReferenceMarkerCp(0xABu)));
+
+    // A lifted control byte that is not printable whitespace becomes a space, so
+    // the transcript never carries an invisible control character.
+    REQUIRE(lsxhome::NormalizeEngineText(
+                Utf8Encode(ReferenceMarkerCp(0x01u))) == " ");
+}
+
+TEST_CASE("lsxhome: stray bytes that cannot form UTF-8 are dropped", "[lsxhome][chat]") {
+    // The engine's decoder hands back raw vocabulary bytes, so an answer can
+    // contain a lone high byte that starts no UTF-8 sequence. Framing that back
+    // into the next prompt fails outright (the tokenizer rejects malformed
+    // UTF-8), so normalization must not pass it on.
+    const std::string lone = {static_cast<char>(0xAB)};
+    REQUIRE(lsxhome::NormalizeEngineText(lone).empty());
+    REQUIRE(lsxhome::NormalizeEngineText(std::string(1, '\xC4')).empty());
+
+    // A broken sequence around real text is repaired, not propagated.
+    const std::string mixed = std::string(kHello) + lone +
+                              Utf8Encode(ReferenceMarkerCp(0x20u)) + kWorld;
+    const std::string fixed = lsxhome::NormalizeEngineText(mixed);
+    REQUIRE(IsValidUtf8(fixed));
+    REQUIRE(fixed == std::string(kHello) + " " + kWorld);
+
+    // A truncated multibyte tail (the model's last token cut off) is dropped.
+    const std::string truncated = std::string(kHello) + "\xD0";
+    const std::string repaired = lsxhome::NormalizeEngineText(truncated);
+    REQUIRE(IsValidUtf8(repaired));
+    REQUIRE(repaired == kHello);
+}
+
+TEST_CASE("lsxhome: a marker pair rebuilds one UTF-8 character", "[lsxhome][chat]") {
+    // A lifted pair must reassemble into the character it encodes; a stray
+    // continuation byte next to real text is removed without touching the text.
+    const std::string with_quote = Utf8Encode(ReferenceMarkerCp(0x20u)) +
+                                   Utf8Encode(0x00C2u) +  // "«"
+                                   kHello +
+                                   Utf8Encode(ReferenceMarkerCp(0x20u));
+    const std::string decoded = lsxhome::NormalizeEngineText(with_quote);
+    REQUIRE(IsValidUtf8(decoded));
+    REQUIRE(decoded == " " + std::string(Utf8Encode(0x00C2u)) + kHello + " ");
+
+    // The whole answer must stay valid UTF-8 after normalization.
+    const std::string text = Utf8Encode(0x00C2u) + kHello +
+                             Utf8Encode(ReferenceMarkerCp(0x20u));
+    REQUIRE(IsValidUtf8(lsxhome::NormalizeEngineText(text)));
+}
+
+TEST_CASE("lsxhome: marker ranges decode to readable text",
           "[lsxhome][chat]") {
     // The engine's decoder returns raw vocabulary bytes, so a generated answer
     // arrives with no ordinary space and no ordinary newline — just U+0120 and
@@ -631,26 +724,34 @@ TEST_CASE("lsxhome: byte-level BPE markers decode back to their bytes",
     // over: the vocabulary sees one 500+ byte "word" (kMaxWordBytes is 512), and
     // the model reads the glyphs as mojibake ("wrong encoding").
     REQUIRE(lsxhome::NormalizeEngineText(
-                ByteLevelMarker(0x0120)) == " ");  // U+0120 -> space
+                Utf8Encode(0x0120)) == " ");  // U+0120 -> space
     REQUIRE(lsxhome::NormalizeEngineText(
-                ByteLevelMarker(0x010A)) == "\n");  // U+010A -> newline
+                Utf8Encode(0x010A)) == "\n");  // U+010A -> newline
     REQUIRE(lsxhome::NormalizeEngineText(
-                ByteLevelMarker(0x0109)) == "\t");  // U+0109 -> tab
-    // The whole range must round-trip, not just the three that are common.
+                Utf8Encode(0x0109)) == "\t");  // U+0109 -> tab
+    // The whole lifted range must decode to a single character/byte, never to
+    // the raw glyph that would otherwise reach the prompt.
     for (unsigned cp = 0x0100u; cp <= 0x0143u; ++cp) {
-        const std::string marker = ByteLevelMarker(cp);
+        const std::string marker = Utf8Encode(cp);
         const std::string decoded = lsxhome::NormalizeEngineText(marker);
         INFO("codepoint=0x" << std::hex << cp << " marker_size=" << marker.size()
                             << " decoded_size=" << decoded.size());
-        REQUIRE_FALSE(decoded.empty());
-        REQUIRE(decoded.size() == 1u);
+        // High bytes that cannot start a UTF-8 sequence on their own are dropped
+        // (they are continuation bytes whose lead byte lives elsewhere).
+        const unsigned byte = ReferenceInverseByte(cp);
+        if (byte > 0x7Fu) {
+            REQUIRE(decoded.empty());
+        } else {
+            REQUIRE(decoded.size() == 1u);
+        }
+        REQUIRE(decoded != marker);  // never the glyph itself
     }
 
     // A full sentence of markers turns back into readable text with real word
     // boundaries.
     const std::string sentence =
-        ByteLevelMarker(0x0120) + std::string(kHello) + ByteLevelMarker(0x0120) +
-        std::string(kWorld) + ByteLevelMarker(0x010A) + ByteLevelMarker(0x010A) +
+        Utf8Encode(0x0120) + std::string(kHello) + Utf8Encode(0x0120) +
+        std::string(kWorld) + Utf8Encode(0x010A) + Utf8Encode(0x010A) +
         std::string(kWorld);
     const std::string normalized = lsxhome::NormalizeEngineText(sentence);
     REQUIRE(normalized ==

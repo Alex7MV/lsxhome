@@ -62,22 +62,6 @@ ImVec4 WidgetColor(ImU32 packed) noexcept {
     return ImGui::ColorConvertU32ToFloat4(packed);
 }
 
-// Debug aid: printable ASCII passes through, everything else becomes \xNN so a
-// broken or invisible codepoint in generated text is visible in the log.
-std::string DebugEscape(std::string_view text, std::size_t max_bytes) {
-    std::string out;
-    for (std::size_t i = 0; i < text.size() && i < max_bytes; ++i) {
-        const unsigned char c = static_cast<unsigned char>(text[i]);
-        if (c >= 0x20 && c < 0x7F) {
-            out += static_cast<char>(c);
-        } else {
-            out += absl::StrCat("\\x", absl::Hex(static_cast<int>(c),
-                                                 absl::kZeroPad2));
-        }
-    }
-    return out;
-}
-
 ImFont* g_heading_font = nullptr;
 
 // The question draft lives in file scope so it survives a refused Submit (a
@@ -498,13 +482,7 @@ void DrawChatPanel(ChatSession& session, ChatState& state) noexcept {
             "[ui] turn closed: interrupted=", interrupted ? 1 : 0,
             " phase=", PhaseLabel(session.phase()),
             " answer_chars=",
-            state.messages().empty() ? 0u : state.messages().back().text.size(),
-            "\n[ui] answer_tail=", DebugEscape(state.messages().empty()
-                                                   ? std::string_view()
-                                                   : std::string_view(
-                                                         state.messages().back()
-                                                             .text),
-                                               240)));
+            state.messages().empty() ? 0u : state.messages().back().text.size()));
         state.EndTurn(interrupted);
     }
 

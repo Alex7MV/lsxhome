@@ -39,27 +39,36 @@ inline std::string NormalizeEngineText(std::string_view text) {
         const unsigned char third =
             i + 2 < text.size() ? static_cast<unsigned char>(text[i + 2]) : 0u;
 
-        // GPT-2 bytes_to_unicode, reversed. U+0100..U+013F is UTF-8 C4 80..C4 BF and
-        // U+0140..U+0143 is C5 80..C5 83 (all two-byte sequences).
+        // GPT-2 bytes_to_unicode, reversed. U+0100..U+013F is UTF-8 C4 80..C4 BF
+        // and U+0140..U+0143 is C5 80..C5 83 (all two-byte sequences).
+        // The lifted bytes are: cp 0x100..0x120 -> 0x00..0x20,
+        // cp 0x121..0x142 -> 0x7F..0xA0, and cp 0x143 -> 0xAD on its own.
         int decoded_byte = -1;
         std::size_t skip = 0;
         if (lead == 0xC4u && second >= 0x80u && second <= 0xBFu) {
             const unsigned cp = 0x100u + (second - 0x80u);  // 0x100..0x13F
-            // cp 0x100..0x120 stands for bytes 0x00..0x20, cp 0x121..0x143 for
-            // bytes 0x7F..0xA3.
-            decoded_byte = cp <= 0x120u ? static_cast<int>(cp - 0x100u)
-                                       : static_cast<int>(cp - 0x121u) + 0x7F;
+            decoded_byte = cp <= 0x120u
+                               ? static_cast<int>(cp - 0x100u)
+                               : static_cast<int>(cp - 0x121u) + 0x7F;
             skip = 2;
         } else if (lead == 0xC5u && second >= 0x80u && second <= 0x83u) {
-            decoded_byte = 0x9E + static_cast<int>(second - 0x80u);  // 0x9E..0xA1
+            // 0x141..0x142 continue the 0x7F..0xA0 run; 0x143 stands alone,
+            // because bytes 0xA1..0xAC are printable Latin-1 and were never
+            // lifted (0xAD, the soft hyphen's second UTF-8 byte, is).
+            const unsigned cp = 0x140u + (second - 0x80u);
+            decoded_byte = cp == 0x143u ? 0xAD
+                                        : 0x9E + static_cast<int>(cp - 0x140u);
             skip = 2;
         }
         if (skip != 0) {
             if (decoded_byte >= 0) {
                 const char byte = static_cast<char>(decoded_byte);
+                const unsigned ubyte = static_cast<unsigned char>(byte);
                 // NUL and the remaining C0 controls mean nothing in a
-                // transcript; newline and tab are content and survive.
-                if (byte == '\0' || (byte < ' ' && byte != '\n' && byte != '\t')) {
+                // transcript; newline and tab are content and survive. The
+                // comparison must be unsigned: a restored 0x80 as a signed char
+                // is negative and would look like a control.
+                if (ubyte == 0u || (ubyte < 0x20u && byte != '\n' && byte != '\t')) {
                     out += ' ';
                 } else {
                     out += byte;
@@ -92,7 +101,48 @@ inline std::string NormalizeEngineText(std::string_view text) {
         out += text[i];
         ++i;
     }
-    return out;
+
+    // The decoder hands back raw vocabulary bytes, so a generated answer can
+    // also contain a lone high byte (a byte-fallback piece) that starts no
+    // UTF-8 sequence, or a sequence the last token cut in half. Framing that
+    // back into the next prompt fails (the tokenizer rejects malformed UTF-8),
+    // so drop whatever cannot form valid text.
+    std::string valid;
+    valid.reserve(out.size());
+    std::size_t j = 0;
+    while (j < out.size()) {
+        const unsigned char lead = static_cast<unsigned char>(out[j]);
+        std::size_t len = 1;
+        if (lead < 0x80u) {
+            len = 1;
+        } else if ((lead & 0xE0u) == 0xC0u) {
+            len = 2;
+        } else if ((lead & 0xF0u) == 0xE0u) {
+            len = 3;
+        } else if ((lead & 0xF8u) == 0xF0u) {
+            len = 4;
+        } else {
+            ++j;  // continuation byte with no lead: drop it
+            continue;
+        }
+        if (j + len > out.size()) {
+            break;  // truncated tail
+        }
+        bool ok = true;
+        for (std::size_t k = 1; k < len; ++k) {
+            if ((static_cast<unsigned char>(out[j + k]) & 0xC0u) != 0x80u) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            ++j;
+            continue;
+        }
+        valid.append(out, j, len);
+        j += len;
+    }
+    return valid;
 }
 
 }  // namespace lsxhome
