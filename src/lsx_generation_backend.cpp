@@ -109,11 +109,27 @@ public:
         // reported to the user instead of being swallowed.
         std::vector<std::int32_t> input_ids;
         if (!model_->BuildConversationInputIds(model_->Tokenizer(),
-                                               conversation, input_ids) ||
+                                               conversation,
+                                               input_ids) ||
             input_ids.empty()) {
-            out_error =
-                "the model's vocabulary rejected the prompt (a character in the "
-                "conversation has no token)";
+            // Distinguish the two ways this can happen, because they are not the
+            // same bug: an empty conversation (the history window dropped
+            // everything) is ours, a rejected encode is the vocabulary's.
+            if (conversation.messages.empty()) {
+                out_error =
+                    "internal: the history window produced an empty prompt";
+            } else {
+                std::size_t chars = 0;
+                for (const auto& message : conversation.messages) {
+                    chars += message.content.size();
+                }
+                out_error = "the model's vocabulary rejected the prompt (" +
+                            std::to_string(conversation.messages.size()) +
+                            " messages, " + std::to_string(chars) +
+                            " bytes; tokenizer_kind=" +
+                            std::to_string(model_->Tokenizer().tokenizer_kind) +
+                            ")";
+            }
             lsxcommon::log::error(absl::StrCat("[engine] ", out_error));
             return GenerationStatus::kError;
         }
@@ -169,10 +185,6 @@ if (result.output_text.empty()) {
             out_error = "the model returned an empty answer";
             return GenerationStatus::kError;
         }
-        // TEMP diagnostic: stderr, so the answer is readable without the engine's
-        // buffered log.
-        std::fprintf(stderr, "[answer] %s\n", result.output_text.c_str());
-        std::fflush(stderr);
         return GenerationStatus::kOk;
     }
 

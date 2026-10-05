@@ -679,6 +679,30 @@ TEST_CASE("lsxhome: C1 control junk is dropped from an answer", "[lsxhome][chat]
     REQUIRE(cleaned == kHello + ", " + kWorld);
 }
 
+TEST_CASE("lsxhome: the engine's replacement marker is dropped from an answer",
+          "[lsxhome][chat]") {
+    // After the engine fix (logestix 456280d) the decoder substitutes U+FFFD for
+    // any byte it cannot reconstruct — that is what this model produces when it
+    // emits byte-fallback pieces. Measured on a real answer: the raw text is
+    // "????? , G??G???" once UTF-8 decoded, i.e. FFFD runs between ASCII letters.
+    // The marker is the engine telling us the model generated unencodable bytes;
+    // showing it to the user as a wall of diamonds helps nobody, so it is dropped
+    // and the surrounding words stay readable.
+    const std::string fffd = "\xEF\xBF\xBD";
+    REQUIRE(lsxhome::NormalizeEngineText(fffd).empty());
+    REQUIRE(lsxhome::NormalizeEngineText("a" + fffd + "b") == "ab");
+    REQUIRE(lsxhome::NormalizeEngineText(kHello + fffd + kWorld) ==
+            kHello + kWorld);
+
+    // A whole answer made of markers collapses to nothing rather than to noise.
+    REQUIRE(lsxhome::NormalizeEngineText(fffd + fffd + fffd).empty());
+
+    // Words stay separated: the marker is removed, not replaced by a space, so
+    // the model never grows phantom whitespace between the surviving words.
+    REQUIRE(lsxhome::NormalizeEngineText("the" + fffd + " answer") ==
+            "the answer");
+}
+
 TEST_CASE("lsxhome: normalization leaves the model's own text byte-identical",
           "[lsxhome][chat]") {
     // ASCII, Cyrillic, emoji, tabs and newlines: untouched.
@@ -705,11 +729,11 @@ TEST_CASE("lsxhome: normalization leaves the model's own text byte-identical",
     const std::string g_with_dot = "\xC4\xA0";
     REQUIRE(lsxhome::NormalizeEngineText(g_with_dot) == g_with_dot);
 
-    // The engine's own repair marker stays visible: it tells the user exactly
-    // where a byte could not be reconstructed.
-    const std::string replacement = "\xEF\xBF\xBD";
-    REQUIRE(lsxhome::NormalizeEngineText("a" + replacement + "b") ==
-            "a" + replacement + "b");
+// The engine's own repair marker is removed (see the test above), while
+    // everything else — including a genuine replacement character written by a
+    // user as content — is untouched.
+    const std::string smart = "\xE2\x80\x9Cquoted\xE2\x80\x9D";
+    REQUIRE(lsxhome::NormalizeEngineText(smart) == smart);
 
     // DEL is invisible junk; it becomes a space so words never fuse.
     REQUIRE(lsxhome::NormalizeEngineText(std::string(1, '\x7F')) == " ");

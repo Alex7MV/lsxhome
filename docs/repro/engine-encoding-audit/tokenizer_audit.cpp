@@ -329,6 +329,57 @@ int main(int argc, char** argv) {
             Report("every framed id exists in the vocabulary", ids_valid,
                    "ids=" + std::to_string(ids.size()) +
                        " unk_id=" + std::to_string(db.unk_id));
+
+            // The exact prompts the shell failed to frame, byte for byte as the
+            // UI sent them. Each must encode; a failure here reproduces the
+            // "vocabulary rejected the prompt" error without loading the model.
+            struct Prompt {
+                const char* label;
+                const char* text;
+            };
+            const Prompt prompts[] = {
+                {"p1 ASCII", "Hello! How are you today?"},
+                {"p2 Cyrillic + question mark",
+                 "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82, "
+                 "\xD0\xBA\xD0\xB0\xD0\xBA "
+                 "\xD0\xB4\xD0\xB5\xD0\xBB\xD0\xB0?"},
+                {"p3 Cyrillic + '!' + hyphen",
+                 "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82! "
+                 "\xD0\x9E\xD1\x82\xD0\xB2\xD0\xB5\xD1\x82\xD1\x8C "
+                 "\xD0\xBF\xD0\xBE-\xD1\x80\xD1\x83\xD1\x81\xD1\x81\xD0\xBA\xD0"
+                 "\xB8 "
+                 "\xD0\xBE\xD0\xB4\xD0\xBD\xD0\xB8\xD0\xBC "
+                 "\xD0\xBF\xD1\x80\xD0\xB5\xD0\xB4\xD0\xBB\xD0\xBE\xD0\xB6"
+                 "\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5\xD0\xBC."},
+                {"p4 ASCII + C1 junk", "Hello! \xC2\x97\xC2\x97 done"},
+                {"p5 long ASCII answer",
+                 "It looks like you might be testing how I handle specific "
+                 "characters or formatting. How can I help you today?"},
+            };
+
+            for (const Prompt& prompt : prompts) {
+                lsxcommon::ChatConversation one;
+                lsxcommon::ChatMessage only;
+                only.role = "user";
+                only.content = prompt.text;
+                one.messages.push_back(only);
+
+                std::string text;
+                const bool render_ok = lsxcommon::RenderGemmaConversation(one, text);
+                std::vector<std::int32_t> prompt_ids;
+                const bool encode_ok = render_ok && lsxcommon::AppendGemmaChatIds(
+                                                        db, text, prompt_ids);
+                std::string detail;
+                if (!render_ok) {
+                    detail = "render failed";
+                } else if (!encode_ok) {
+                    detail = "encode failed; rendered=[" +
+                             Escape(text).substr(0, 140) + "]";
+                } else {
+                    detail = "ids=" + std::to_string(prompt_ids.size());
+                }
+                Report(prompt.label, encode_ok && !prompt_ids.empty(), detail);
+            }
         }
     }
 
