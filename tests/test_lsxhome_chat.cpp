@@ -6,6 +6,7 @@
 #include "lsxhome/gui_bridge.h"
 #include "lsxhome/history_budget.h"
 #include "lsxhome/model_root.h"
+#include "lsxhome/prompt_repair.h"
 #include "lsxhome/text_normalizer.h"
 #include "lsxhome/text_splitter.h"
 
@@ -807,4 +808,61 @@ TEST_CASE("lsxhome: the budget is measured in bytes", "[lsxhome][chat]") {
     const auto windowed = lsxhome::TrimHistoryToBudget(history, 16);
     REQUIRE(windowed.size() == 1);
     REQUIRE(windowed[0].text == history[0].text);
+}
+
+// ── Prompt repair ────────────────────────────────────────────────────────────
+TEST_CASE("lsxhome: text the tokenizer accepts is returned untouched",
+          "[lsxhome][chat]") {
+    // A tokenizer that accepts everything must see exactly one call and change
+    // nothing: this is the common path, and it must stay cheap.
+    int calls = 0;
+    const auto encodable = [&](std::string_view) {
+        ++calls;
+        return true;
+    };
+    const std::string text = "Привет, как дела?";
+    REQUIRE(lsxhome::DropUnencodable(encodable, text) == text);
+    REQUIRE(calls == 1);
+}
+
+TEST_CASE("lsxhome: a rejected byte is dropped, the rest of the word survives",
+          "[lsxhome][chat]") {
+    // A stand-in vocabulary: a byte sequence encodes unless it contains 0xFF,
+    // which is how a real tokenizer refuses a byte it cannot represent.
+    const auto encodable = [](std::string_view s) {
+        return s.find('\xFF') == std::string_view::npos;
+    };
+
+    const std::string cleaned =
+        lsxhome::DropUnencodable(encodable, "bad\xFFword keep this");
+    REQUIRE(cleaned == "badword keep this");
+
+    // A rejected byte at the edge does not take the word with it.
+    REQUIRE(lsxhome::DropUnencodable(encodable, "\xFFkeep") == "keep");
+    REQUIRE(lsxhome::DropUnencodable(encodable, "keep\xFF") == "keep");
+
+    // Multibyte characters must survive whole: their individual bytes never
+    // encode on their own, so a byte-wise walk would delete every Cyrillic
+    // character from the prompt.
+    const std::string hello = kHello;  // D0 9F D1 80 ... (2 bytes per character)
+    REQUIRE(lsxhome::DropUnencodable(encodable, hello) == hello);
+    REQUIRE(lsxhome::DropUnencodable(encodable, hello + "\xFF") == hello);
+    REQUIRE(lsxhome::DropUnencodable(encodable, hello + "\xFF" + kWorld) ==
+            hello + kWorld);
+
+    // Word boundaries and separators are preserved exactly, including newlines
+    // and tabs, because the prompt layout is the model's chat template.
+    REQUIRE(lsxhome::DropUnencodable(encodable, "a\nb\tc") == "a\nb\tc");
+    REQUIRE(lsxhome::DropUnencodable(encodable, " x\xFF y ") == " x y ");
+}
+
+TEST_CASE("lsxhome: a word of nothing but bad bytes disappears entirely",
+          "[lsxhome][chat]") {
+    const auto encodable = [](std::string_view s) {
+        return s.find('\xFF') == std::string_view::npos &&
+               s.find('\xFE') == std::string_view::npos;
+    };
+    REQUIRE(lsxhome::DropUnencodable(encodable, "\xFF\xFE").empty());
+    REQUIRE(lsxhome::DropUnencodable(encodable, "ok \xFF\xFE done") ==
+            "ok  done");
 }

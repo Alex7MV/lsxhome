@@ -345,10 +345,12 @@ lsxhome_copy_third_party_notices(lsxhome)
 add_executable(tokenizer_audit
     docs/repro/engine-encoding-audit/tokenizer_audit.cpp
 )
+target_include_directories(tokenizer_audit PRIVATE include)
 target_compile_definitions(tokenizer_audit PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(tokenizer_audit PRIVATE
     lsxcommon
     arrow_shared
+    arrow_cuda_shared
     absl::flat_hash_map
     absl::span
     absl::strings

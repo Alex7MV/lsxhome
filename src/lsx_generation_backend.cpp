@@ -8,8 +8,10 @@
 #include "lsxhome/history_budget.h"
 #include "lsxhome/lsx_generation_backend.h"
 #include "lsxhome/model_root.h"
+#include "lsxhome/prompt_repair.h"
 #include "lsxhome/text_normalizer.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -37,6 +39,30 @@ constexpr int kMaxGenTokens = 512;
 /// four turns of one conversation). ~4000 bytes of Cyrillic history is a few
 /// turns of context — enough to follow along, bounded enough to stay responsive.
 constexpr std::size_t kHistoryBudgetBytes = 4000;
+
+namespace {
+
+/// True when the vocabulary can encode @p text as it stands.
+bool Encodes(const lsxcommon::ArrowTokenizerDb& tok, std::string_view text) {
+    std::vector<std::int32_t> ids(1024);
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        std::size_t cap = ids.size();
+        const std::int32_t rc =
+            lsxcommon::arrow_tokenizer_encode(tok, text.data(), text.size(),
+                                              ids.data(), &cap);
+        if (rc >= 0) {
+            return true;
+        }
+        if (rc != -2 || ids.size() > (1u << 18)) {
+            return false;
+        }
+        ids.resize(ids.size() * 4);
+    }
+    return false;
+}
+
+
+}  // namespace
 
 class LsxGenerationBackend final : public GenerationBackend {
 public:
@@ -104,14 +130,38 @@ public:
             conversation.messages.push_back(std::move(message));
         }
 
-        // One framing attempt: the conversation is rendered with the model's own
-        // chat template and encoded with its vocabulary. A rejection here is
-        // reported to the user instead of being swallowed.
+        // Framing: the model's own chat template plus its vocabulary. A prompt it
+        // refuses is retried once with the offending bytes removed, so a stray
+        // character in an answer cannot cost the user the whole conversation.
         std::vector<std::int32_t> input_ids;
-        if (!model_->BuildConversationInputIds(model_->Tokenizer(),
-                                               conversation,
-                                               input_ids) ||
-            input_ids.empty()) {
+        bool framed = model_->BuildConversationInputIds(model_->Tokenizer(),
+                                                        conversation, input_ids) &&
+                      !input_ids.empty();
+        if (!framed) {
+            std::size_t removed = 0;
+            for (auto& message : conversation.messages) {
+                std::string cleaned =
+                    DropUnencodable(
+                        [tok = &model_->Tokenizer()](std::string_view s) {
+                            return Encodes(*tok, s);
+                        },
+                        message.content);
+                if (cleaned.size() != message.content.size()) {
+                    removed += message.content.size() - cleaned.size();
+                    message.content = std::move(cleaned);
+                }
+            }
+            if (removed != 0) {
+                input_ids.clear();
+                framed = model_->BuildConversationInputIds(model_->Tokenizer(),
+                                                          conversation, input_ids) &&
+                         !input_ids.empty();
+                lsxcommon::log::warn(absl::StrCat(
+                    "[engine] prompt needed repair: dropped ", removed,
+                    " unencodable byte(s)"));
+            }
+        }
+        if (!framed) {
             // Distinguish the two ways this can happen, because they are not the
             // same bug: an empty conversation (the history window dropped
             // everything) is ours, a rejected encode is the vocabulary's.

@@ -17,6 +17,12 @@
 
 #include "lsxcommon/chat_conversation.h"
 #include "lsxcommon/gemma_tool_format.h"
+#include "lsxcommon/model.h"
+#include "lsxcommon/model_engine.h"
+#include "lsxcommon/model_factory.h"
+#include "lsxhome/history_budget.h"
+#include "lsxhome/prompt_repair.h"
+#include "lsxhome/text_normalizer.h"
 #include "lsxcommon/tokenizer.h"
 
 #include <arrow/io/file.h>  // arrow::io::MemoryMappedFile
@@ -385,5 +391,146 @@ int main(int argc, char** argv) {
 
     std::printf("\n%s: %d check(s) failed\n", g_failures ? "AUDIT" : "clean",
                 g_failures);
+
+    // ── Optional: the same framing path the shell uses, with the tokenizer the
+    // LOADED MODEL carries (not the mmap file). The shell fails there while this
+    // file's checks pass, so the two db views have to be compared.
+    if (argc >= 3 && std::string(argv[2]) == "--model") {
+        std::printf("\n=== model-loaded tokenizer ===\n");
+        auto session = std::make_unique<lsxcommon::InferenceEngine::Session>();
+        lsxcommon::ModelInitConfig config;
+        config.model_path = root;
+        config.max_gen_tokens = 8;
+        auto model = lsxcommon::LsxModelFactory::Create(config);
+        if (!model || !model->Load()) {
+            std::printf("model load failed: %s\n", model ? "Load()" : "Create()");
+            return 2;
+        }
+        const lsxcommon::ArrowTokenizerDb& mdb = model->Tokenizer();
+        std::printf("model tokenizer: kind=%d byte_fallback=%d vocab=%d "
+                    "dummy_prefix=%d escape_ws=%d\n",
+                    mdb.tokenizer_kind, mdb.byte_fallback, mdb.vocab_size,
+                    mdb.add_dummy_prefix, mdb.escape_whitespaces);
+        std::printf("byte_to_token_id[0x20]=%d [0xD0]=%d [0x9F]=%d [0x41]=%d\n",
+                    mdb.byte_to_token_id[0x20], mdb.byte_to_token_id[0xD0],
+                    mdb.byte_to_token_id[0x9F], mdb.byte_to_token_id[0x41]);
+
+        // The exact call the shell makes.
+        const char* question =
+            "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82, "
+            "\xD0\xBA\xD0\xB0\xD0\xBA \xD0\xB4\xD0\xB5\xD0\xBB\xD0\xB0?";
+        lsxcommon::ChatConversation one;
+        lsxcommon::ChatMessage only;
+        only.role = "user";
+        only.content = question;
+        one.messages.push_back(only);
+
+        std::vector<std::int32_t> ids;
+        const bool ok = model->BuildConversationInputIds(model->Tokenizer(), one, ids);
+        Report("model->BuildConversationInputIds(cyrillic)", ok && !ids.empty(),
+               "ids=" + std::to_string(ids.size()));
+
+        const char* ascii = "Hello! How are you today?";
+        lsxcommon::ChatConversation plain;
+        lsxcommon::ChatMessage ascii_msg;
+        ascii_msg.role = "user";
+        ascii_msg.content = ascii;
+        plain.messages.push_back(ascii_msg);
+        std::vector<std::int32_t> ascii_ids;
+        const bool ascii_ok =
+            model->BuildConversationInputIds(model->Tokenizer(), plain, ascii_ids);
+        Report("model->BuildConversationInputIds(ascii)",
+               ascii_ok && !ascii_ids.empty(),
+               "ids=" + std::to_string(ascii_ids.size()));
+
+        // The shell's own path: history -> NormalizeEngineText ->
+        // TrimHistoryToBudget -> BuildConversationInputIds. Reproducing it here
+        // (no window, no generation) isolates whether the failure is ours.
+        std::vector<lsxhome::ChatTurn> history = {
+            {"user", question},
+            {"assistant",
+             "It looks like you might be testing out some special characters "
+             "or formatting! How can I help you today?"},
+            {"user", question},
+        };
+        const std::vector<lsxhome::ChatTurn> windowed =
+            lsxhome::TrimHistoryToBudget(history, 4000);
+        Report("TrimHistoryToBudget keeps the newest question",
+               windowed.size() == history.size() &&
+                   windowed.back().role == "user",
+               "kept=" + std::to_string(windowed.size()) + " of " +
+                   std::to_string(history.size()));
+
+        lsxcommon::ChatConversation shelled;
+        for (const auto& turn : windowed) {
+            lsxcommon::ChatMessage message;
+            message.role = turn.role;
+            message.content = lsxhome::NormalizeEngineText(turn.text);
+            shelled.messages.push_back(std::move(message));
+        }
+        std::vector<std::int32_t> shell_ids;
+        const bool shell_ok = model->BuildConversationInputIds(
+            model->Tokenizer(), shelled, shell_ids);
+        Report("shell path: normalize + window + frame", shell_ok && !shell_ids.empty(),
+               "ids=" + std::to_string(shell_ids.size()));
+
+        // And with an answer that still carries the engine's U+FFFD marker, as a
+        // real answer does when the model emits byte-fallback pieces.
+        history.push_back({"assistant",
+                           "?????? , G??G?? \xEF\xBF\xBD G??"});
+        const std::vector<lsxhome::ChatTurn> windowed2 =
+            lsxhome::TrimHistoryToBudget(history, 4000);
+        lsxcommon::ChatConversation with_marker;
+        for (const auto& turn : windowed2) {
+            lsxcommon::ChatMessage message;
+            message.role = turn.role;
+            message.content = lsxhome::NormalizeEngineText(turn.text);
+            with_marker.messages.push_back(std::move(message));
+        }
+        std::vector<std::int32_t> marker_ids;
+        const bool marker_ok = model->BuildConversationInputIds(
+            model->Tokenizer(), with_marker, marker_ids);
+        Report("shell path with an U+FFFD-bearing answer", marker_ok && !marker_ids.empty(),
+               "ids=" + std::to_string(marker_ids.size()));
+
+        // The repair path: give it text the vocabulary refuses and check that
+        // the repaired prompt frames. This is the fallback the shell runs when a
+        // prompt is rejected, so it is verified here rather than in the window.
+        const auto encodable = [&model](std::string_view s) {
+            std::vector<std::int32_t> ids(1024);
+            for (int attempt = 0; attempt < 6; ++attempt) {
+                std::size_t cap = ids.size();
+                const std::int32_t rc = lsxcommon::arrow_tokenizer_encode(
+                    model->Tokenizer(), s.data(), s.size(), ids.data(), &cap);
+                if (rc >= 0) return true;
+                if (rc != -2 || ids.size() > (1u << 18)) return false;
+                ids.resize(ids.size() * 4);
+            }
+            return false;
+        };
+        const std::string poisoned =
+            std::string("\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82") +
+            "\xFF" + " " + "\xD0\xBA\xD0\xB0\xD0\xBA";
+        const std::string repaired =
+            lsxhome::DropUnencodable(encodable, poisoned);
+        Report("DropUnencodable removes only the refused bytes",
+               !encodable(poisoned) && encodable(repaired) &&
+                   repaired.find('\xFF') == std::string::npos &&
+                   repaired.find("\xD0\x9F") == 0,
+               "before=[" + Escape(poisoned) + "] after=[" +
+                   Escape(repaired) + "]");
+
+        lsxcommon::ChatConversation fixed;
+        lsxcommon::ChatMessage fixed_msg;
+        fixed_msg.role = "user";
+        fixed_msg.content = repaired;
+        fixed.messages.push_back(fixed_msg);
+        std::vector<std::int32_t> fixed_ids;
+        const bool fixed_ok = model->BuildConversationInputIds(
+            model->Tokenizer(), fixed, fixed_ids);
+        Report("repaired prompt frames", fixed_ok && !fixed_ids.empty(),
+               "ids=" + std::to_string(fixed_ids.size()));
+    }
+
     return g_failures ? 1 : 0;
 }
