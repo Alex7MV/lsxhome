@@ -88,7 +88,8 @@ alloc/free contract is verifiable without a GPU.
   panel), `lsx_generation_backend.cpp` (the only TU that includes `lsxcommon`).
 - `include/lsxhome/` — `d3d12_renderer.h`, `font_loader.h`, `gui_bridge.h`,
   `spsc_token_ring.h`, `srv_descriptor_pool.h`, `swapchain_targets.h`,
-  `text_splitter.h`, `text_normalizer.h`, `model_root.h`, `blackwell_theme.h`,
+  `text_splitter.h`, `text_normalizer.h`, `prompt_repair.h`, `history_budget.h`,
+  `model_root.h`, `blackwell_theme.h`,
   `gui_renderer.h`, `imnodes_offsetof_shim.h`, `chat_state.h`, `chat_session.h`,
   `generation_backend.h`, `lsx_generation_backend.h`.
 - `cmake/` — `embed_binary.cmake` + `embed_font.ps1` (TTF → byte-array TU),
