@@ -20,7 +20,7 @@ hosts. `linux-check` exists only to verify that no-op path.
 
 | Dependency | Version | Source | License | Type |
 |---|---|---|---|---|
-| logestix (`lsxcommon`) | pinned SHA `7c03e12…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
+| logestix (`lsxcommon`) | pinned SHA `879e422…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
 | Dear ImGui | `v1.92.9b-docking` | FetchContent | MIT | Static (`lsxhome_imgui`) |
 | ImPlot | `v1.0` | FetchContent | MIT | Static (`lsxhome_implot`) |
 | ImNodes | `v0.5` | FetchContent | MIT | Static (`lsxhome_imnodes`) |
@@ -115,7 +115,9 @@ alloc/free contract is verifiable without a GPU.
   `PROJECT_SOURCE_DIR`, `M_PI` became `std::numbers::pi`, and `expert_store.h`
   guards `munmap` itself. `7c03e12` additionally exports the NVCC options the
   public headers require via an INTERFACE target, so consumers compiling their
-  own `.cu` no longer have to rediscover them.
+  own `.cu` no longer have to rediscover them. At `879e422` the guard around
+  `--expt-relaxed-constexpr` keeps Debug builds from reaching that INTERFACE
+  flag (see the CUDA 13.4 caveat below).
 - Every after-fetch patch (engine, ImNodes, FreeType) goes through
   `lsxhome_replace_in_file()` in `cmake/patch_vendored_sources.cmake`, which
   rewrites each key exactly once and **hard-fails the configure** when a key is
@@ -130,13 +132,19 @@ alloc/free contract is verifiable without a GPU.
   configure. The Kimi `setenv` patch did exactly that (five nested `#ifdef`
   layers) before it was dropped. Re-verify necessity against
   `git show <pin>:<file>` on the *pristine* checkout before adding a patch.
-- CUDA 13.4 caveat for any future `.cu` in this shell: `--expt-relaxed-constexpr`
-  plus `_DEBUG` (implied by `/MDd`) makes NVVM abort device codegen with
-  `parse Invalid instruction with no BB (Producer: 'LLVM23.0.0')` in
-  `perf_calibration.cu` and `gigachat_moe_inference_pipeline.cu`. The engine
-  passes the flag to its own TUs with no Debug guard, so the two upstream TUs
-  fail; lsxhome compiles only `.cpp` and is unaffected. Reproduced on
-  CUDA 13.4.92 / LLVM 23.
+- CUDA 13.4 caveat, **Debug only**: `--expt-relaxed-constexpr` plus `_DEBUG`
+  (implied by `/MDd`) makes NVVM abort device codegen with `parse Invalid
+  instruction with no BB (Producer: 'LLVM23.0.0')`. At `879e422` the engine
+  guards the flag out of Debug (`$<$<NOT:$<CONFIG:Debug>>:--expt-relaxed-constexpr>`),
+  which removes the abort but breaks the build the other way: kernels call
+  `constexpr __host__ Offset(...)` from `__global__`, which needs the flag.
+  Measured at `879e422`: Debug fails in `gemma_dense_inference.cu`,
+  `xing_moe_kernels.cu` and `xing_moe_inference.cu` with "calling a constexpr
+  __host__ function ... is not allowed". So Debug is blocked inside the engine
+  either way — either the flag is on and NVVM aborts, or it is off and those
+  calls do not compile. **Release is the working configuration for lsxhome.**
+  Reproduced on CUDA 13.4.92 / LLVM 23; report material in
+  `docs/repro/engine-encoding-audit/nvcc-13.4-invalid-instruction.md`.
 - FreeType is static with zlib/bzip2/brotli/harfbuzz/png discovery disabled.
 - `lsx_embed_binary()` runs `embed_font.ps1` on Windows (linear-time byte
   emitter); the plain-CMake path is a slow fallback.

@@ -88,3 +88,22 @@
 #   Two other translation units of the same project fail identically
 #   (perf_calibration.cu, gigachat_moe_inference_pipeline.cu), which suggests a
 #   common ingredient rather than one pathological kernel.
+#
+# UPDATE (engine pin 879e422)
+#   The engine now guards the flag out of Debug:
+#     $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;$<$<NOT:$<CONFIG:Debug>>:--expt-relaxed-constexpr>>
+#   so in Debug nvcc no longer receives --expt-relaxed-constexpr. The NVVM abort
+#   disappears — and the build breaks the other way instead:
+#
+#     gemma_dense_inference.cu: error: calling a constexpr __host__ function
+#       ("Offset") from a __global__ function ("gemma_dense_attn_kernel") is
+#       not allowed. The experimental flag '--expt-relaxed-constexpr' can be
+#       used to allow this ...
+#     (also xing_moe_kernels.cu and xing_moe_inference.cu)
+#
+#   So Debug is blocked either way on CUDA 13.4:
+#     * flag present -> NVVM: parse Invalid instruction with no BB;
+#     * flag absent  -> nvcc: constexpr __host__ call from __global__.
+#   A permanent fix needs a flag that compiles the `constexpr __host__ Offset`
+#   calls correctly AND does not abort NVVM in a /MDd configuration. Release
+#   builds are unaffected.
