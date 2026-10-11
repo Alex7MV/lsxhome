@@ -51,7 +51,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_vendored_sources.cmake)
 # ── Engine: pinned logestix checkout ─────────────────────────────────────────
 # The pin is a full commit SHA (logestix has no release tags). GIT_SHALLOW is
 # FALSE because a raw SHA cannot be fetched shallowly.
-set(LSXHOME_LOGESTIX_TAG "80aaee9ecc229d512728fe29399f3f76de8eb394" CACHE STRING "logestix commit SHA the engine is pinned to")
+set(LSXHOME_LOGESTIX_TAG "f99008b737c081dde171555a1bbb8d25b269e071" CACHE STRING "logestix commit SHA the engine is pinned to")
 set(LSXHOME_LOGESTIX_SOURCE_DIR "" CACHE PATH "Local logestix checkout (development override)")
 
 # Build only the engine library from logestix — never its sibling applications,
@@ -70,15 +70,11 @@ else()
         GIT_TAG        "${LSXHOME_LOGESTIX_TAG}"
         GIT_SHALLOW    FALSE
     )
-    # Populate first so the CUDA 13.4 Debug patch can be applied before the
-    # engine's CMakeLists is executed — MakeAvailable would configure the engine
-    # immediately.
-    FetchContent_GetProperties(logestix)
-    if(NOT logestix_POPULATED)
-        FetchContent_Populate(logestix)
-    endif()
-    lsxhome_patch_logestix("${logestix_SOURCE_DIR}")
-    add_subdirectory("${logestix_SOURCE_DIR}" "${FETCHCONTENT_BASE_DIR}/logestix-build")
+    # No after-fetch patch is needed any more: the engine's own CMakeLists
+    # carries the Debug guard around --expt-relaxed-constexpr, and its KV-cache
+    # geometry helpers are __host__ __device__ (logestix f99008b), so a Debug
+    # build compiles without the flag.
+    FetchContent_MakeAvailable(logestix)
 endif()
 
 # Resolve the engine source directory so its own THIRD_PARTY_NOTICES can be

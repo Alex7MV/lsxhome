@@ -107,3 +107,14 @@
 #   A permanent fix needs a flag that compiles the `constexpr __host__ Offset`
 #   calls correctly AND does not abort NVVM in a /MDd configuration. Release
 #   builds are unaffected.
+#
+# UPDATE 2 (engine pin f99008b) — RESOLVED UPSTREAM
+#   logestix f99008b "fix: make the KV-cache geometry helpers __host__ __device__"
+#   adds the device attribute to the geometry helpers (lsx_kv_cache.h), and the
+#   engine keeps its own Debug guard around --expt-relaxed-constexpr. With the
+#   flag out of Debug there is nothing left that needs it, so both Debug and
+#   Release now compile. Verified on Windows/MSVC: windows-debug and
+#   windows-release both green. lsxhome dropped its after-fetch patch for this
+#   (its key disappeared, which is exactly what the patch-drift guard is for).
+#   The Debug NVVM abort below remains a latent CUDA 13.4 issue for any Debug
+#   build that does pass --expt-relaxed-constexpr.

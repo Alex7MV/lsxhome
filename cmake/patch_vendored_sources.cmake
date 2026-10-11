@@ -10,10 +10,12 @@
 #   * FreeType ships FT_CONFIG_OPTION_SUBPIXEL_RENDERING commented out, but
 #     imgui_freetype needs pixel-LCD rendering for LCD glyphs.
 #
-# The logestix engine needs exactly one patch (CUDA 13.4, below). Everything
-# else lsxhome once patched there is fixed upstream: the `${CMAKE_SOURCE_DIR}/
-# third_party` paths became `PROJECT_SOURCE_DIR`, `M_PI` became
-# `std::numbers::pi`, `expert_store.h` guards `munmap` itself, and
+# The logestix engine no longer needs any patch: it carries its own Debug guard
+# around `--expt-relaxed-constexpr` and its KV-cache geometry helpers are
+# `__host__ __device__` (f99008b), so a Debug build compiles without the flag.
+# Everything lsxhome once patched there is now fixed upstream: the
+# `${CMAKE_SOURCE_DIR}/third_party` paths became `PROJECT_SOURCE_DIR`, `M_PI`
+# became `std::numbers::pi`, `expert_store.h` guards `munmap` itself, and
 # `kimi_moe_inference.cu` guards `setenv` since bbf6771. A patch for a problem
 # the dependency already fixed is not harmless dead weight — its search key
 # usually survives inside an upstream `#else` branch, so the rewrite re-wraps the
@@ -74,28 +76,4 @@ function(lsxhome_replace_in_file path old new)
     endif()
     string(REPLACE "${old}" "${new}" _content "${_content}")
     file(WRITE "${path}" "${_content}")
-endfunction()
-
-# The one patch the engine still needs, applied before its CMakeLists runs.
-function(lsxhome_patch_logestix root)
-    if(NOT EXISTS "${root}/CMakeLists.txt")
-        message(FATAL_ERROR "lsxhome_patch_logestix: ${root} is not a logestix checkout")
-    endif()
-
-    # CUDA 13.4 NVVM regression. In a Debug build (/MDd implies _DEBUG) the
-    # combination `--expt-relaxed-constexpr` + `_DEBUG` makes device codegen
-    # abort with
-    #     <unnamed>: parse Invalid instruction with no BB
-    #                (Producer: 'LLVM23.0.0' Reader: 'LLVM 23.0.0')
-    # in perf_calibration.cu and gigachat_moe_inference_pipeline.cu. The engine
-    # passes the flag to its own object libraries with no Debug guard.
-    # The flag only *permits* more relaxed constexpr — it does not change the
-    # meaning of code that already compiles — so dropping it for Debug is safe.
-    # The search key includes the neighbouring `--extended-lambda;` so the
-    # replacement no longer contains the key.
-    # Reproduced on CUDA 13.4.92 / LLVM 23 by building the engine in Debug with
-    # this patch disabled.
-    lsxhome_replace_in_file("${root}/libs/lsxcommon/CMakeLists.txt"
-        "--extended-lambda;--expt-relaxed-constexpr"
-        "--extended-lambda;\$<\$<NOT:\$<CONFIG:Debug>>:--expt-relaxed-constexpr>")
 endfunction()
