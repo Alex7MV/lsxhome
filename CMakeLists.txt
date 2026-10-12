@@ -51,7 +51,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_vendored_sources.cmake)
 # ── Engine: pinned logestix checkout ─────────────────────────────────────────
 # The pin is a full commit SHA (logestix has no release tags). GIT_SHALLOW is
 # FALSE because a raw SHA cannot be fetched shallowly.
-set(LSXHOME_LOGESTIX_TAG "f99008b737c081dde171555a1bbb8d25b269e071" CACHE STRING "logestix commit SHA the engine is pinned to")
+set(LSXHOME_LOGESTIX_TAG "31998bf90b14e6021398a7c521a6912ca4ed88f1" CACHE STRING "logestix commit SHA the engine is pinned to")
 set(LSXHOME_LOGESTIX_SOURCE_DIR "" CACHE PATH "Local logestix checkout (development override)")
 
 # Build only the engine library from logestix — never its sibling applications,
