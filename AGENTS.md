@@ -20,7 +20,7 @@ hosts. `linux-check` exists only to verify that no-op path.
 
 | Dependency | Version | Source | License | Type |
 |---|---|---|---|---|
-| logestix (`lsxcommon`) | pinned SHA `31998bf…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
+| logestix (`lsxcommon`) | pinned SHA `2212086…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
 | Dear ImGui | `v1.92.9b-docking` | FetchContent | MIT | Static (`lsxhome_imgui`) |
 | ImPlot | `v1.0` | FetchContent | MIT | Static (`lsxhome_implot`) |
 | ImNodes | `v0.5` | FetchContent | MIT | Static (`lsxhome_imnodes`) |
@@ -105,6 +105,16 @@ alloc/free contract is verifiable without a GPU.
   `add_subdirectory` — under CMake 4.x a nested directory being first to enable
   CUDA breaks. `find_package(CUDAToolkit REQUIRED)`.
 - `CMAKE_POLICY_VERSION_MINIMUM 3.5` is forced for Arrow's bundled xsimd.
+- `CMAKE_POLICY_DEFAULT_CMP0076` and `CMAKE_POLICY_DEFAULT_CMP0091` are forced
+  `NEW` for Arrow 26 (engine `2212086`). The engine points `CMAKE_PROJECT_INCLUDE`
+  at a file whose body is `cmake_minimum_required(VERSION 3.5)` (its CMake-4.x
+  compatibility hack for xsimd), and that runs inside every nested `project()`,
+  resetting the policy version so policies newer than 3.5 are UNSET there. Arrow
+  26 bundles Boost 1.92 (INTERFACE targets list `extra/*.natvis` relatively -
+  needs CMP0076, else "Cannot find source file") and uriparser 1.0.2 (aborts with
+  `Policy CMP0091 behavior is '' rather than 'NEW', mis-compilation detected`).
+  Both NEW defaults match CMake >= 3.15 and keep the MSVC runtime default
+  (`/MD` Release, `/MDd` Debug), so no ABI changes.
 - `CMAKE_RUNTIME_OUTPUT_DIRECTORY` = `${CMAKE_BINARY_DIR}/bin`.
 - The GUI stack is built as separate static archives; `lsxhome_imgui` exposes
   `IMGUI_DEFINE_MATH_OPERATORS` PUBLIC. `IMGUI_DISABLE_OBSOLETE_FUNCTIONS` is

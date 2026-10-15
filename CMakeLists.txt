@@ -48,10 +48,32 @@ include(FetchContent)
 # tests/cmake/patch_drift_guard_test.cmake.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_vendored_sources.cmake)
 
+# ── Nested-project policy defaults (Arrow 26 on MSVC) ────────────────────────
+# The engine keeps its own CMake-4.x compatibility hack: it points
+# CMAKE_PROJECT_INCLUDE at a file whose body is `cmake_minimum_required(VERSION
+# 3.5)` (so pre-4.x nested projects like xsimd are not rejected). That include
+# runs inside every nested project(), and cmake_minimum_required(VERSION 3.5)
+# resets the policy *version* for that scope, leaving policies introduced after
+# 3.5 UNSET. Arrow 26 (engine 2212086) bundles Boost 1.92 and uriparser 1.0.2,
+# and both now hard-depend on such policies on MSVC:
+#   * CMP0076 (3.13) - target_sources() relative paths are made absolute; Boost's
+#     INTERFACE targets list `extra/*.natvis` relatively, and OLD behavior cannot
+#     resolve them (configure fails with "Cannot find source file").
+#   * CMP0091 (3.15) - MSVC runtime selected through CMAKE_MSVC_RUNTIME_LIBRARY;
+#     uriparser 1.0.2 aborts configure with `Policy CMP0091 behavior is '' rather
+#     than 'NEW', mis-compilation detected`.
+# Both NEW defaults match what CMake >= 3.15 applies when cmake_minimum_required
+# is not downgraded, and they do not change the selected MSVC runtime: the
+# default is still /MD (Release) and /MDd (Debug), so no ABI shifts. Set as cache
+# variables so they reach the engine's nested projects, which the engine's
+# own cmake_minimum_required would otherwise reset.
+set(CMAKE_POLICY_DEFAULT_CMP0076 NEW CACHE STRING "Arrow 26 bundled Boost INTERFACE natvis needs relative target_sources" FORCE)
+set(CMAKE_POLICY_DEFAULT_CMP0091 NEW CACHE STRING "Arrow 26 bundled uriparser 1.0.2 requires the MSVC runtime abstraction" FORCE)
+
 # ── Engine: pinned logestix checkout ─────────────────────────────────────────
 # The pin is a full commit SHA (logestix has no release tags). GIT_SHALLOW is
 # FALSE because a raw SHA cannot be fetched shallowly.
-set(LSXHOME_LOGESTIX_TAG "31998bf90b14e6021398a7c521a6912ca4ed88f1" CACHE STRING "logestix commit SHA the engine is pinned to")
+set(LSXHOME_LOGESTIX_TAG "2212086da80179e292378f83cf3eba5d21801da8" CACHE STRING "logestix commit SHA the engine is pinned to")
 set(LSXHOME_LOGESTIX_SOURCE_DIR "" CACHE PATH "Local logestix checkout (development override)")
 
 # Build only the engine library from logestix — never its sibling applications,
