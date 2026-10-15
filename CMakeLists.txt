@@ -48,32 +48,29 @@ include(FetchContent)
 # tests/cmake/patch_drift_guard_test.cmake.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_vendored_sources.cmake)
 
-# ── Nested-project policy defaults (Arrow 26 on MSVC) ────────────────────────
-# The engine keeps its own CMake-4.x compatibility hack: it points
-# CMAKE_PROJECT_INCLUDE at a file whose body is `cmake_minimum_required(VERSION
-# 3.5)` (so pre-4.x nested projects like xsimd are not rejected). That include
-# runs inside every nested project(), and cmake_minimum_required(VERSION 3.5)
-# resets the policy *version* for that scope, leaving policies introduced after
-# 3.5 UNSET. Arrow 26 (engine 2212086) bundles Boost 1.92 and uriparser 1.0.2,
-# and both now hard-depend on such policies on MSVC:
-#   * CMP0076 (3.13) - target_sources() relative paths are made absolute; Boost's
-#     INTERFACE targets list `extra/*.natvis` relatively, and OLD behavior cannot
-#     resolve them (configure fails with "Cannot find source file").
-#   * CMP0091 (3.15) - MSVC runtime selected through CMAKE_MSVC_RUNTIME_LIBRARY;
-#     uriparser 1.0.2 aborts configure with `Policy CMP0091 behavior is '' rather
-#     than 'NEW', mis-compilation detected`.
-# Both NEW defaults match what CMake >= 3.15 applies when cmake_minimum_required
-# is not downgraded, and they do not change the selected MSVC runtime: the
-# default is still /MD (Release) and /MDd (Debug), so no ABI shifts. Set as cache
-# variables so they reach the engine's nested projects, which the engine's
-# own cmake_minimum_required would otherwise reset.
-set(CMAKE_POLICY_DEFAULT_CMP0076 NEW CACHE STRING "Arrow 26 bundled Boost INTERFACE natvis needs relative target_sources" FORCE)
-set(CMAKE_POLICY_DEFAULT_CMP0091 NEW CACHE STRING "Arrow 26 bundled uriparser 1.0.2 requires the MSVC runtime abstraction" FORCE)
+# ── Arrow 26 / CMake-4.x policy level ────────────────────────────────────────
+# No consumer-side workaround is needed. Engine 78da023 replaced its
+# CMAKE_PROJECT_INCLUDE hack (a generated file whose body was
+# `cmake_minimum_required(VERSION 3.5)`, included at the end of every nested
+# project() and resetting that scope's policy level to 3.5 — which flipped
+# CMP0076/CMP0091, and every other post-3.5 policy, to OLD) with a single
+# `set(CMAKE_POLICY_VERSION_MINIMUM 3.5)`. That raised the floor only for
+# sub-projects asking below 3.5 and left modern ones intact, so Arrow 26's
+# bundled Boost 1.92 natvis sources and uriparser 1.0.2 no longer break under the
+# Visual Studio generator. Do NOT reintroduce
+# CMAKE_POLICY_DEFAULT_CMP0076/CMP0091 here — if the engine regresses, fix it
+# there, not by masking policies at the consumer.
 
 # ── Engine: pinned logestix checkout ─────────────────────────────────────────
 # The pin is a full commit SHA (logestix has no release tags). GIT_SHALLOW is
 # FALSE because a raw SHA cannot be fetched shallowly.
-set(LSXHOME_LOGESTIX_TAG "2212086da80179e292378f83cf3eba5d21801da8" CACHE STRING "logestix commit SHA the engine is pinned to")
+#
+# The tag is a FORCE cache entry on purpose: without FORCE a stale CMakeCache.txt
+# (windows-debug/ and windows-release/ keep their own) would shadow the literal
+# below and a bump would silently keep the old commit. FORCE makes editing the
+# SHA here authoritative. Selecting a different engine revision is done with
+# LSXHOME_LOGESTIX_SOURCE_DIR (a local checkout), not by overriding this entry.
+set(LSXHOME_LOGESTIX_TAG "78da023fac5e6fd4bd1a66b69ebc22664b6fa370" CACHE STRING "logestix commit SHA the engine is pinned to" FORCE)
 set(LSXHOME_LOGESTIX_SOURCE_DIR "" CACHE PATH "Local logestix checkout (development override)")
 
 # Build only the engine library from logestix — never its sibling applications,

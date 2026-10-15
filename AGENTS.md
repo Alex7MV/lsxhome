@@ -20,7 +20,7 @@ hosts. `linux-check` exists only to verify that no-op path.
 
 | Dependency | Version | Source | License | Type |
 |---|---|---|---|---|
-| logestix (`lsxcommon`) | pinned SHA `2212086…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
+| logestix (`lsxcommon`) | pinned SHA `78da023…` | FetchContent / local override | AGPL-3.0 | Static + shared (`arrow.dll`) |
 | Dear ImGui | `v1.92.9b-docking` | FetchContent | MIT | Static (`lsxhome_imgui`) |
 | ImPlot | `v1.0` | FetchContent | MIT | Static (`lsxhome_implot`) |
 | ImNodes | `v0.5` | FetchContent | MIT | Static (`lsxhome_imnodes`) |
@@ -33,6 +33,14 @@ Engine bring-up flags are forced OFF in `CMakeLists.txt`
 (`LOGESTIX_BUILD_APPS`/`TOOLS`/`TESTS`), so only `lsxcommon` is produced. To
 develop against a local engine checkout instead of the pinned remote, pass
 `-DLSXHOME_LOGESTIX_SOURCE_DIR=<path>` at configure time.
+
+The engine pin `LSXHOME_LOGESTIX_TAG` is a **FORCE** cache entry, so bumping the
+SHA in `CMakeLists.txt` takes effect on the next plain `cmake -S . -B <dir>` (or
+preset) configure, without wiping the build directory. Without `FORCE` a stale
+`CMakeCache.txt` in `build/windows-*` would shadow the literal and silently keep
+the old commit — the reason every build tree carries its own cache. Selecting a
+different engine revision is the `LSXHOME_LOGESTIX_SOURCE_DIR` override above,
+not overriding the tag.
 
 ## Build
 
@@ -105,16 +113,20 @@ alloc/free contract is verifiable without a GPU.
   `add_subdirectory` — under CMake 4.x a nested directory being first to enable
   CUDA breaks. `find_package(CUDAToolkit REQUIRED)`.
 - `CMAKE_POLICY_VERSION_MINIMUM 3.5` is forced for Arrow's bundled xsimd.
-- `CMAKE_POLICY_DEFAULT_CMP0076` and `CMAKE_POLICY_DEFAULT_CMP0091` are forced
-  `NEW` for Arrow 26 (engine `2212086`). The engine points `CMAKE_PROJECT_INCLUDE`
-  at a file whose body is `cmake_minimum_required(VERSION 3.5)` (its CMake-4.x
-  compatibility hack for xsimd), and that runs inside every nested `project()`,
-  resetting the policy version so policies newer than 3.5 are UNSET there. Arrow
-  26 bundles Boost 1.92 (INTERFACE targets list `extra/*.natvis` relatively -
-  needs CMP0076, else "Cannot find source file") and uriparser 1.0.2 (aborts with
-  `Policy CMP0091 behavior is '' rather than 'NEW', mis-compilation detected`).
-  Both NEW defaults match CMake >= 3.15 and keep the MSVC runtime default
-  (`/MD` Release, `/MDd` Debug), so no ABI changes.
+- No consumer-side policy workaround is needed for Arrow 26. Up to engine
+  `2212086` the engine pointed `CMAKE_PROJECT_INCLUDE` at a generated file whose
+  body was `cmake_minimum_required(VERSION 3.5)` (its CMake-4.x compatibility
+  hack for xsimd); that file runs at the end of every nested `project()`, so it
+  reset that scope's policy level to 3.5 and flipped CMP0076/CMP0091 — and every
+  other post-3.5 policy — to OLD. Arrow 26 bundles Boost 1.92 (INTERFACE targets
+  list `extra/*.natvis` relatively — needs CMP0076, else "Cannot find source
+  file") and uriparser 1.0.2 (aborts with `Policy CMP0091 behavior is '' rather
+  than 'NEW', mis-compilation detected`), both of which the reset broke under the
+  Visual Studio generator. Engine `78da023` replaced the injection with the
+  documented `set(CMAKE_POLICY_VERSION_MINIMUM 3.5)`, which raises the floor only
+  for sub-projects that ask below 3.5 and leaves modern ones intact. Do not
+  reintroduce `CMAKE_POLICY_DEFAULT_CMP0076`/`CMP0091` here — if the engine
+  regresses, fix it there, not by masking policies at the consumer.
 - `CMAKE_RUNTIME_OUTPUT_DIRECTORY` = `${CMAKE_BINARY_DIR}/bin`.
 - The GUI stack is built as separate static archives; `lsxhome_imgui` exposes
   `IMGUI_DEFINE_MATH_OPERATORS` PUBLIC. `IMGUI_DISABLE_OBSOLETE_FUNCTIONS` is
