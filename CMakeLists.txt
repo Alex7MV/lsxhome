@@ -70,7 +70,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_vendored_sources.cmake)
 # below and a bump would silently keep the old commit. FORCE makes editing the
 # SHA here authoritative. Selecting a different engine revision is done with
 # LSXHOME_LOGESTIX_SOURCE_DIR (a local checkout), not by overriding this entry.
-set(LSXHOME_LOGESTIX_TAG "0502ff32d3678dd107e113dfeafdf3b2689584a5" CACHE STRING "logestix commit SHA the engine is pinned to" FORCE)
+set(LSXHOME_LOGESTIX_TAG "84711eb513d1ea19572478c652d8560efe86ff24" CACHE STRING "logestix commit SHA the engine is pinned to" FORCE)
 set(LSXHOME_LOGESTIX_SOURCE_DIR "" CACHE PATH "Local logestix checkout (development override)")
 
 # Build only the engine library from logestix — never its sibling applications,
